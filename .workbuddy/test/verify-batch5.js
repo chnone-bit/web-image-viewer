@@ -144,8 +144,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       t.dispatchEvent(e);
     };
     P(thumb, 'pointerdown', 400);
-    ok('按下即进入拖拽态', strip.classList.contains('fiv-dragging'));
+    // ⚠️ 断言已修正（v1.5.2）：按下时**不应**进入拖拽态。
+    //    旧断言「按下即进入拖拽态」实际上在固化一个 bug：
+    //    .fiv-dragging 会让 .fiv-thumb pointer-events:none，
+    //    导致松手时浏览器 click 命中测试失败 → 缩略图永远点不动。
+    ok('按下时尚未进入拖拽态（避免 pointer-events:none 杀掉 click）',
+      !strip.classList.contains('fiv-dragging'),
+      strip.classList.contains('fiv-dragging') ? '已加 dragging 类' : '');
     P(thumb, 'pointermove', 250);
+    ok('越阈值后进入拖拽态', strip.classList.contains('fiv-dragging'));
     ok('在缩略图上拖动产生滚动', sl === 150, 'scrollLeft=' + sl);
     P(thumb, 'pointerup', 250);
     ok('松手退出拖拽态', !strip.classList.contains('fiv-dragging'));
@@ -182,10 +189,47 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     strip.releasePointerCapture = function () { strip.__capture = null; };
 
     const target = (t) => (strip.__capture || t);
+
+    /* ---- 模拟真实浏览器的 click 目标解析 ----
+     * 真实浏览器 click 的 target = pointerdown 命中元素 ∩ pointerup 命中元素
+     * 的「最近公共祖先」。
+     *
+     * 这解释了 Bug1 的真实机制：
+     *   pointerdown 时 .fiv-dragging 已加 → thumb 是 pointer-events:none
+     *     → 按下命中测试落到 strip（thumb 被跳过）
+     *   pointerup 时 finish() 已移除 .fiv-dragging → 松手命中 thumb
+     *   两者公共祖先 = strip  → click 派发到 strip
+     *   → 缩略图自身的 click 监听器**永不触发** = 「点不动」
+     *
+     * jsdom 不实现这一层，必须手工模拟，否则该 bug 会溜过测试。 */
+    const isPEThumb = (el) => el && el.classList && el.classList.contains('fiv-thumb');
+    // 返回该点在给定 dragging 状态下「命中」的元素
+    const hitAt = (t, dragging) => {
+      if (isPEThumb(t) && dragging) return strip;   // thumb 被 pointer-events:none 跳过
+      return t;
+    };
+    // 最近公共祖先
+    const ancestorOrSelf = (el, maybeAnc) => {
+      let n = el;
+      while (n) { if (n === maybeAnc) return maybeAnc; n = n.parentNode; }
+      return null;
+    };
+    const commonAncestor = (a, b) => {
+      let n = a;
+      while (n) { if (ancestorOrSelf(b, n)) return n; n = n.parentNode; }
+      return null;
+    };
+    // 记录按下时的 dragging 状态，用于解析 click target
+    let draggingAtDown = false;
+    const resolveClickTarget = (t) => commonAncestor(hitAt(t, draggingAtDown), hitAt(t, false)) || t;
+
     const PD = (t, x) => {
       const e = new w.PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: 500, pointerId: 1, pointerType: 'mouse', button: 0 });
       Object.defineProperty(e, 'target', { value: target(t), configurable: true });
       target(t).dispatchEvent(e);
+      // ⚠️ 派发之后再读：pointerdown 处理器可能刚刚加上了 .fiv-dragging。
+      //    浏览器做按下命中测试的时刻，正是处理器执行完毕后的状态。
+      draggingAtDown = strip.classList.contains('fiv-dragging');
     };
     const PU = (t, x) => {
       const e = new w.PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: 500, pointerId: 1, pointerType: 'mouse', button: 0 });
@@ -193,7 +237,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       target(t).dispatchEvent(e);
     };
     const CLICK = (t) => {
-      const real = target(t);
+      // 真实浏览器：click target 由按下/松手命中共同决定
+      const real = strip.__capture ? strip : resolveClickTarget(target(t));
+      CLICK.__target = real;
       const e = new w.MouseEvent('click', { bubbles: true, cancelable: true });
       Object.defineProperty(e, 'target', { value: real, configurable: true });
       real.dispatchEvent(e);
@@ -206,6 +252,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       strip.__capture ? '已捕获' : '');
     PU(thumbs[2], 300);
     CLICK(thumbs[2]);
+    ok('纯点击：click 目标仍是缩略图本身（按下时未被 pointer-events:none 跳过）',
+      CLICK.__target === thumbs[2],
+      'click target = ' + (CLICK.__target === thumbs[2] ? 'thumb' : CLICK.__target.className));
     await sleep(60);
     ok('纯点击缩略图能切图（bug: 点不动）', V.index === 2, 'index=' + V.index + ' (before ' + before + ')');
 

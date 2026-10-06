@@ -2,7 +2,7 @@
 // @name         网页图片浏览器
 // @name:en      Web Image Viewer
 // @namespace    local.web.imageviewer
-// @version      1.5.1
+// @version      1.5.2
 // @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark
 // @match        *://*/*
@@ -24,7 +24,7 @@
    * ========================================================================= */
 
   const NS = 'fiv';                     // 命名空间前缀
-  const VERSION = '1.5.1';              // 与头部 @version 保持一致
+  const VERSION = '1.5.2';              // 与头部 @version 保持一致
   const Z_BASE = 2147483000;            // 遮罩层级
   const LOG_PREFIX = '[图片浏览器]';
 
@@ -3015,15 +3015,25 @@ kbd.${NS}-kbd {
     /**
      * 缩略图条拖拽快速翻阅。
      *
-     * 修复要点（v1.5）：
-     *  1. **允许在缩略图上直接起拖**。旧逻辑遇到 .fiv-thumb 就 return，
-     *     而缩略图几乎铺满整条，实际只剩几像素的间隙能拖 → 表现为「拖不动」。
-     *     现在改为：任意位置按下都可拖，靠位移阈值区分「点击」与「拖动」。
-     *  2. **用 Pointer Events + setPointerCapture**。旧实现监听 window 的
-     *     mousemove，鼠标快速移出条外或拖到 iframe 上会丢事件导致卡在拖拽态。
-     *     指针捕获让元素持续收到事件，松手必然收敛。
-     *  3. **拖动后吞掉紧跟的 click**。用 moved 标记，避免「拖完松手又触发切图」。
-     *  4. 拖拽期间给 strip 加 .fiv-dragging，用 CSS 关掉缩略图的指针响应。
+     * 每次踩坑都值得记下来 —— 这个函数已经被指针语义坑了三次：
+     *
+     *  1. **允许在缩略图上直接起拖**（v1.5）。旧逻辑遇到 .fiv-thumb 就 return，
+     *     而缩略图几乎铺满整条，实际只剩几像素的间隙能拖 → 「拖不动」。
+     *     现在任意位置按下都可拖，靠位移阈值区分「点击」与「拖动」。
+     *
+     *  2. **指针捕获必须推迟到越过阈值**（v1.5.1）。若在 pointerdown 就
+     *     setPointerCapture，浏览器会把 pointerup 与 click 一并重定向到 strip，
+     *     缩略图的 click 监听器收不到 → 「能滚但点不动」。
+     *
+     *  3. **.fiv-dragging 也必须推迟到越过阈值**（v1.5.2）。
+     *     该类的 CSS 会把 .fiv-thumb 设成 pointer-events:none。
+     *     若按下就加：浏览器做按下命中测试时跳过缩略图、命中落到 strip；
+     *     松手时类已移除、命中恢复为缩略图。click 的 target = 两次命中的
+     *     最近公共祖先 = strip → 缩略图 click 依旧收不到 → 「还是点不动」。
+     *
+     * 教训：**凡是会改变命中测试（pointer-events / 捕获）的状态，
+     * 都不能在 pointerdown 里设置**，必须等拖动意图确认后再设。
+     * 而 jsdom 不模拟命中测试，所以这些 bug 只能靠手工模拟 + 真机验证兜住。
      */
     function bindStripDrag() {
       if (!strip || !track) return;
@@ -3052,11 +3062,18 @@ kbd.${NS}-kbd {
         down = true; moved = false;
         sx = e.clientX; sl = track.scrollLeft;
         pid = e.pointerId;
-        strip.classList.add(NS + '-dragging');
-        // ⚠️ 关键：**不要在按下时就 setPointerCapture**。
-        //    浏览器一旦捕获成功，会把这个指针后续的 pointerup 与 **click**
-        //    全部重定向到捕获元素(strip)，导致缩略图自身的 click 监听器永远收不到
-        //    → 「能滚动但点不动」。捕获推迟到真正越过拖动阈值时再做。
+        // ⚠️ 这里**不加** .fiv-dragging，也**不** setPointerCapture。
+        //    两者的原因都是「不能破坏随后的 click」：
+        //
+        //    (1) .fiv-dragging 的 CSS 会把 .fiv-thumb 设为 pointer-events:none。
+        //        若在按下时就加，浏览器做**按下命中测试**时会跳过缩略图、
+        //        把命中落到 strip 上；而松手时 finish() 已移除该类、命中恢复为缩略图。
+        //        浏览器 click 的 target = 按下命中 ∩ 松手命中的最近公共祖先
+        //        = strip → 缩略图自身的 click 监听器**永不触发** = 「点不动」。
+        //        （这正是 v1.5.1 漏掉的第二根因，jsdom 不模拟命中测试所以测试全绿。）
+        //    (2) setPointerCapture 会把 pointerup 与 click 一并重定向到 strip，
+        //        同样让缩略图收不到 click。
+        //    → 二者都推迟到「真正越过拖动阈值」时再做。
       });
 
       strip.addEventListener('pointermove', (e) => {
@@ -3064,7 +3081,9 @@ kbd.${NS}-kbd {
         const dx = e.clientX - sx;
         if (!moved && Math.abs(dx) > THRESHOLD) {
           moved = true;
-          // 刚开始拖动：此刻才捕获指针，保证拖出 strip 外也能持续滚动
+          // 确认为拖动：此刻才加拖拽态（关闭缩略图指针响应，防原生图片拖拽）
+          strip.classList.add(NS + '-dragging');
+          // 并捕获指针，保证拖出 strip 外也能持续滚动
           try { strip.setPointerCapture(pid); } catch (err) {}
         }
         if (moved) track.scrollLeft = sl - dx;
