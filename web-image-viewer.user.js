@@ -2,8 +2,8 @@
 // @name         网页图片浏览器
 // @name:en      Web Image Viewer
 // @namespace    local.web.imageviewer
-// @version      1.5.2
-// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
+// @version      1.6.0
+// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，失败清单）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark
 // @match        *://*/*
 // @grant        GM_setValue
@@ -24,7 +24,7 @@
    * ========================================================================= */
 
   const NS = 'fiv';                     // 命名空间前缀
-  const VERSION = '1.5.2';              // 与头部 @version 保持一致
+  const VERSION = '1.6.0';              // 与头部 @version 保持一致
   const Z_BASE = 2147483000;            // 遮罩层级
   const LOG_PREFIX = '[图片浏览器]';
 
@@ -1268,6 +1268,347 @@
   })();
 
   /* =========================================================================
+   * 2.5 ImageDownloader —— 批量打包下载（当前组 / 全部）
+   *
+   * 设计契约（源自 CHANGELOG「计划中功能：批量打包下载」的评审结论）：
+   *   · **单向依赖**：只读 items（由调用方传入快照），不持有 ImagePool，
+   *     不回写 seenKeys / current / scope —— 严禁污染图片池状态。
+   *   · **不加新权限**：只用 fetch（同源 + 缓存 + 凭据正确）。跨域失败进失败清单，
+   *     不做 GM_xmlhttpRequest 降级（二期再议）。
+   *   · **STORE 模式 ZIP**（level:0）：图片本身已压缩，再 deflate 只会白耗 CPU
+   *     且可能变大。同时避免引入第三方库。
+   *   · **并发取 + 顺序写**：并发受限地取 Blob，但写入 ZIP 严格按 items 顺序。
+   *   · **失败清单**：拿不到的图如实列出，绝不静默跳过。
+   * ========================================================================= */
+
+  const ImageDownloader = (function () {
+    const CONCURRENCY = 4;          // 同时进行的请求数
+    const TIMEOUT = 20000;          // 单张超时(ms)
+    const MAX_NAME = 120;           // 文件名单段长度上限(字符)，留足余量
+
+    /* ---------------- CRC32（ZIP 必需） ---------------- */
+    let crcTable = null;
+    function makeCrcTable() {
+      const t = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c >>> 0;
+      }
+      return t;
+    }
+    function crc32(u8) {
+      if (!crcTable) crcTable = makeCrcTable();
+      let c = 0xFFFFFFFF;
+      for (let i = 0; i < u8.length; i++) c = crcTable[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    /* ---------------- 小端写入工具 ---------------- */
+    function u16(v) { return [v & 0xFF, (v >>> 8) & 0xFF]; }
+    function u32(v) { return [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF]; }
+
+    /**
+     * 生成 STORE 模式（无压缩）ZIP 的字节流。
+     * @param {Array<{name:string, data:Uint8Array}>} files
+     * @returns {Uint8Array}
+     *
+     * 说明：
+     *  - 文件名统一按 UTF-8 编码，并置通用标志位 bit 11（0x0800），
+     *    否则中文名在部分 Windows 解压工具下会乱码。
+     *  - 时间戳使用 DOS 格式，取固定值（1980-01-01），避免引入时区差异。
+     *  - 不生成 ZIP64（单文件 < 4GB、条目 < 65535 时不需要；超限时抛错由上层分卷）。
+     */
+    function buildZip(files) {
+      if (files.length > 0xFFFF) throw new Error('条目过多，需要分卷');
+      const enc = new TextEncoder();
+      const locals = [];
+      const centrals = [];
+      let offset = 0;
+
+      for (const f of files) {
+        const nameBytes = enc.encode(f.name);
+        const data = f.data;
+        if (data.length > 0xFFFFFFFF) throw new Error('单文件过大，需要分卷');
+        const crc = crc32(data);
+        const size = data.length;
+
+        // —— 本地文件头 ——
+        const local = [].concat(
+          u32(0x04034b50),          // 签名
+          u16(20),                  // 版本(2.0)
+          u16(0x0800),              // 标志位：UTF-8 文件名
+          u16(0),                   // 压缩方法 0 = STORE
+          u16(0), u16(0x0021),      // 修改时间 / 日期（1980-01-01）
+          u32(crc),                 // CRC-32
+          u32(size),                // 压缩后大小
+          u32(size),                // 原始大小
+          u16(nameBytes.length),    // 文件名长度
+          u16(0)                    // 扩展区长度
+        );
+        const localHead = new Uint8Array(local);
+        const localOffset = offset;
+        offset += localHead.length + nameBytes.length + size;
+
+        // —— 中央目录条目 ——
+        const central = [].concat(
+          u32(0x02014b50),          // 签名
+          u16(20),                  // 创建版本
+          u16(20),                  // 所需版本
+          u16(0x0800),              // 标志位
+          u16(0),                   // 压缩方法
+          u16(0), u16(0x0021),      // 时间 / 日期
+          u32(crc),
+          u32(size),
+          u32(size),
+          u16(nameBytes.length),
+          u16(0),                   // 扩展区
+          u16(0),                   // 注释
+          u16(0),                   // 磁盘号
+          u16(0),                   // 内部属性
+          u32(0),                   // 外部属性
+          u32(localOffset)          // 本地头偏移
+        );
+        centrals.push({ head: new Uint8Array(central), name: nameBytes });
+        locals.push({ head: localHead, name: nameBytes, data });
+      }
+
+      // 中央目录大小
+      let centralSize = 0;
+      for (const c of centrals) centralSize += c.head.length + c.name.length;
+
+      // —— 中央目录结束记录 ——
+      const end = new Uint8Array([].concat(
+        u32(0x06054b50),
+        u16(0), u16(0),
+        u16(files.length), u16(files.length),
+        u32(centralSize),
+        u32(offset),
+        u16(0)
+      ));
+
+      const total = offset + centralSize + end.length;
+      const out = new Uint8Array(total);
+      let p = 0;
+      for (const l of locals) {
+        out.set(l.head, p); p += l.head.length;
+        out.set(l.name, p); p += l.name.length;
+        out.set(l.data, p); p += l.data.length;
+      }
+      for (const c of centrals) {
+        out.set(c.head, p); p += c.head.length;
+        out.set(c.name, p); p += c.name.length;
+      }
+      out.set(end, p);
+      return out;
+    }
+
+    /* ---------------- 文件名 ---------------- */
+
+    // Windows 保留名（不区分大小写，含带扩展名形式）
+    const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+
+    /** MIME → 扩展名（不信任 URL 后缀） */
+    function extFromMime(mime) {
+      if (!mime) return '';
+      const m = mime.toLowerCase().split(';')[0].trim();
+      const map = {
+        'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/pjpeg': 'jpg',
+        'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp',
+        'image/avif': 'avif', 'image/bmp': 'bmp', 'image/x-ms-bmp': 'bmp',
+        'image/svg+xml': 'svg', 'image/tiff': 'tiff', 'image/x-icon': 'ico',
+        'image/vnd.microsoft.icon': 'ico', 'image/heic': 'heic', 'image/heif': 'heif'
+      };
+      return map[m] || '';
+    }
+
+    /** 从原始文件名里取扩展名（小写，去点） */
+    function extFromName(name) {
+      const m = /\.([a-z0-9]{1,5})$/i.exec(name || '');
+      return m ? m[1].toLowerCase() : '';
+    }
+
+    /**
+     * 清洗单个文件名（不含序号、不含目录）。
+     * 处理：非法字符 / 控制字符 / Windows 保留名 / 尾随空格与点 / 长度上限 / 路径穿越。
+     */
+    function sanitizeName(raw) {
+      let n = String(raw == null ? '' : raw);
+      // 去掉路径分隔与穿越
+      n = n.replace(/[\\/]/g, '_');
+      // 去掉控制字符与 Windows 非法字符
+      // eslint-disable-next-line no-control-regex
+      n = n.replace(/[\u0000-\u001f\u007f<>:"|?*]/g, '_');
+      // 去掉开头的点（避免隐藏文件 / ..）
+      n = n.replace(/^\.+/, '');
+      // 尾随空格与点（Windows 不允许）
+      n = n.replace(/[ .]+$/, '');
+      n = n.trim();
+      if (!n) return 'image';
+      // 保留名兜底
+      if (WIN_RESERVED.test(n)) n = '_' + n;
+      // 长度上限（保留扩展名）
+      if (n.length > MAX_NAME) {
+        const ext = extFromName(n);
+        const stem = ext ? n.slice(0, n.length - ext.length - 1) : n;
+        const keep = MAX_NAME - (ext ? ext.length + 1 : 0);
+        n = stem.slice(0, Math.max(1, keep)) + (ext ? '.' + ext : '');
+      }
+      return n;
+    }
+
+    /**
+     * 生成最终文件名：序号(3位) + 原名 + 扩展名（MIME 优先，其次原名，末位兜底 .jpg）。
+     * @param {number} i   序号（从 0 起）
+     * @param {string} rawName 池内记录的原始名
+     * @param {string} mime    响应 Content-Type
+     */
+    function makeFilename(i, rawName, mime) {
+      const seq = String(i + 1).padStart(3, '0');
+      let base = sanitizeName(rawName || '');
+      // 剥掉原扩展名，稍后统一决定
+      const origExt = extFromName(base);
+      let stem = origExt ? base.slice(0, base.length - origExt.length - 1) : base;
+      stem = sanitizeName(stem) || 'image';
+      const ext = extFromMime(mime) || origExt || 'jpg';
+      // 序号已经在前面保证唯一，stem 也可能过长，再收一次
+      let name = seq + '_' + stem + '.' + ext;
+      if (name.length > MAX_NAME + 8) {
+        name = seq + '_' + stem.slice(0, MAX_NAME - ext.length - 5) + '.' + ext;
+      }
+      return name;
+    }
+
+    /* ---------------- 取 Blob ---------------- */
+
+    /**
+     * 取单张图片的二进制。仅接受 http/https。
+     * @returns {Promise<{bytes:Uint8Array, mime:string}>}
+     */
+    async function fetchOne(item, signal) {
+      if (!isSafeExternalUrl(item.src)) throw new Error('地址不受支持');
+      const ctrl = new AbortController();
+      const onAbort = () => ctrl.abort();
+      if (signal) {
+        if (signal.aborted) throw new Error('已取消');
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      const timer = setTimeout(() => ctrl.abort(), TIMEOUT);
+      try {
+        const resp = await fetch(item.src, {
+          credentials: 'include',       // 带上同源凭据（跨域时浏览器会按 CORS 规则处理）
+          referrerPolicy: 'no-referrer',
+          signal: ctrl.signal,
+          cache: 'force-cache'          // 优先用 `<img>` 已建立的 HTTP 缓存
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const mime = resp.headers.get('content-type') || '';
+        if (mime && !/^image\//i.test(mime) && !/octet-stream/i.test(mime)) {
+          throw new Error('非图片响应');
+        }
+        const buf = await resp.arrayBuffer();
+        return { bytes: new Uint8Array(buf), mime };
+      } finally {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+      }
+    }
+
+    /* ---------------- 主流程 ---------------- */
+
+    /**
+     * 打包下载。
+     * @param {Array} items        图片条目快照（**拷贝**，不持有引用）
+     * @param {Object} opts
+     *   @param {string}   opts.zipName   产出文件名（不含 .zip）
+     *   @param {Function} opts.onProgress (done, total, phase)
+     *   @param {AbortSignal} opts.signal
+     * @returns {Promise<{ok:number, failed:Array<{item,files,reason}>, bytes:number, cancelled:boolean}>}
+     */
+    async function download(items, opts) {
+      const o = opts || {};
+      const list = (items || []).slice();
+      const total = list.length;
+      const signal = o.signal;
+      const onProgress = typeof o.onProgress === 'function' ? o.onProgress : null;
+      const results = new Array(total);
+      let done = 0;
+      let cancelled = false;
+
+      const report = (phase) => { if (onProgress) onProgress(done, total, phase); };
+
+      // 并发受限地取 Blob
+      let cursor = 0;
+      async function worker() {
+        while (cursor < total) {
+          if (signal && signal.aborted) { cancelled = true; return; }
+          const i = cursor++;
+          const it = list[i];
+          try {
+            const r = await fetchOne(it, signal);
+            results[i] = { ok: true, item: it, bytes: r.bytes, mime: r.mime };
+          } catch (e) {
+            if (signal && signal.aborted) { cancelled = true; return; }
+            results[i] = { ok: false, item: it, reason: (e && e.message) || String(e) };
+          }
+          done++;
+          report('fetch');
+        }
+      }
+      const workers = [];
+      const n = Math.max(1, Math.min(CONCURRENCY, total));
+      for (let k = 0; k < n; k++) workers.push(worker());
+      await Promise.all(workers);
+
+      if (cancelled || (signal && signal.aborted)) {
+        return { ok: 0, failed: [], bytes: 0, cancelled: true };
+      }
+
+      // 按 items 顺序组装（成功项）
+      const files = [];
+      const failed = [];
+      for (let i = 0; i < total; i++) {
+        const r = results[i];
+        if (!r) continue;
+        if (r.ok) {
+          files.push({ name: makeFilename(i, r.item.name, r.mime), data: r.bytes });
+        } else {
+          failed.push({ item: r.item, reason: r.reason });
+        }
+      }
+      if (!files.length) {
+        return { ok: 0, failed, bytes: 0, cancelled: false };
+      }
+
+      report('zip');
+      const zipBytes = buildZip(files);
+      const blob = new Blob([zipBytes], { type: 'application/zip' });
+
+      // 触发保存
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = (sanitizeName(o.zipName || 'images') || 'images') + '.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+
+      return { ok: files.length, failed, bytes: zipBytes.length, cancelled: false };
+    }
+
+    return {
+      download,
+      /* 暴露纯函数便于测试 */
+      _buildZip: buildZip,
+      _crc32: crc32,
+      _makeFilename: makeFilename,
+      _sanitizeName: sanitizeName,
+      _extFromMime: extFromMime
+    };
+  })();
+
+  /* =========================================================================
    * 3. ThemeProbe —— 主题探测（自适应论坛原生风格）
    * ========================================================================= */
 
@@ -1732,6 +2073,45 @@ img.${NS}-hot { outline: 2px solid var(--fiv-accent, #2563eb); outline-offset: 2
 }
 .${NS}-toast.${NS}-on { opacity: 1; transform: translate(-50%, 0); }
 
+/* ---------- 打包下载进度 ---------- */
+.${NS}-pack {
+  position: fixed; left: 50%; top: 26px; transform: translate(-50%, -12px);
+  z-index: ${Z_BASE + 6};
+  min-width: 280px; max-width: min(520px, 88vw);
+  padding: 11px 14px 12px;
+  border-radius: var(--fiv-radius);
+  background: var(--fiv-chip); color: var(--fiv-fg);
+  border: 1px solid var(--fiv-border);
+  box-shadow: 0 8px 26px rgba(0,0,0,.35);
+  font: 500 13px/1.4 var(--fiv-font);
+  opacity: 0; transition: opacity .2s ease, transform .2s ease;
+  pointer-events: none;
+}
+.${NS}-pack.${NS}-on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+.${NS}-pack-row { display: flex; align-items: center; gap: 10px; }
+.${NS}-pack-txt { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.${NS}-pack-cancel {
+  flex: 0 0 auto; cursor: pointer;
+  padding: 4px 10px; border-radius: 6px;
+  background: transparent; color: var(--fiv-fg);
+  border: 1px solid var(--fiv-border);
+  font: inherit; font-size: 12px;
+}
+.${NS}-pack-cancel:hover { background: var(--fiv-chip-hover); }
+.${NS}-pack-bar {
+  margin-top: 8px; height: 4px; border-radius: 2px;
+  background: var(--fiv-border); overflow: hidden;
+}
+.${NS}-pack-fill {
+  height: 100%; width: 0; background: var(--fiv-accent);
+  transition: width .18s ease;
+}
+.${NS}-pack-detail {
+  margin-top: 7px; max-height: 120px; overflow-y: auto;
+  font-size: 12px; line-height: 1.5; opacity: .8;
+  white-space: pre-wrap; word-break: break-all;
+}
+
 /* ---------- 配置面板 ---------- */
 .${NS}-panel-mask {
   position: fixed; inset: 0; z-index: ${Z_BASE + 10};
@@ -1917,7 +2297,8 @@ kbd.${NS}-kbd {
     fit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V5a1 1 0 011-1h4"/><path d="M20 9V5a1 1 0 00-1-1h-4"/><path d="M4 15v4a1 1 0 001 1h4"/><path d="M20 15v4a1 1 0 01-1 1h-4"/></svg>',
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5l11 7-11 7z"/></svg>',
     pause: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>',
-    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-2.9 1.2 2 2 0 11-4 0 1.7 1.7 0 00-2.9-1.2l-.1.1a2 2 0 11-2.8-2.8l.1-.1A1.7 1.7 0 003 15a2 2 0 010-4 1.7 1.7 0 001.2-2.9l-.1-.1a2 2 0 112.8-2.8l.1.1A1.7 1.7 0 0010 4.6a2 2 0 014 0 1.7 1.7 0 002.9 1.2l.1-.1a2 2 0 112.8 2.8l-.1.1A1.7 1.7 0 0021 11a2 2 0 010 4z"/></svg>'
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-2.9 1.2 2 2 0 11-4 0 1.7 1.7 0 00-2.9-1.2l-.1.1a2 2 0 11-2.8-2.8l.1-.1A1.7 1.7 0 003 15a2 2 0 010-4 1.7 1.7 0 001.2-2.9l-.1-.1a2 2 0 112.8-2.8l.1.1A1.7 1.7 0 0010 4.6a2 2 0 014 0 1.7 1.7 0 002.9 1.2l.1-.1a2 2 0 112.8 2.8l-.1.1A1.7 1.7 0 0021 11a2 2 0 010 4z"/></svg>',
+    package: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>'
   };
 
   /* =========================================================================
@@ -1970,6 +2351,7 @@ kbd.${NS}-kbd {
           <button class="${NS}-tbtn" data-act="hide-strip" title="显示/隐藏缩略图条 (T)">${ICONS.fit}</button>
           <button class="${NS}-tbtn" data-act="play" title="自动播放 (Space)">${ICONS.play}</button>
           <button class="${NS}-tbtn" data-act="download" title="下载当前图片 (D)">${ICONS.download}</button>
+          <button class="${NS}-tbtn" data-act="pack-group" title="打包下载本组 (Shift+D)">${ICONS.package}</button>
           <button class="${NS}-tbtn" data-act="copy" title="复制图片链接 (C)">${ICONS.link}</button>
           <button class="${NS}-tbtn" data-act="open" title="新标签打开原图 (O)">${ICONS.external}</button>
           <button class="${NS}-tbtn" data-act="settings" title="设置 (Shift+/)">${ICONS.settings}</button>
@@ -2819,6 +3201,119 @@ kbd.${NS}-kbd {
       toast('已开始下载：' + (it.name || ''));
     }
 
+    /* ---------------- 批量打包下载 ---------------- */
+
+    let packEl = null, packTxt = null, packFill = null, packDetail = null, packCtrl = null;
+    let packAbort = null;
+
+    function ensurePackUI() {
+      if (packEl) return;
+      packEl = document.createElement('div');
+      packEl.className = NS + '-pack';
+      packEl.innerHTML =
+        '<div class="' + NS + '-pack-row">' +
+        '<span class="' + NS + '-pack-txt"></span>' +
+        '<button class="' + NS + '-pack-cancel" type="button">取消</button>' +
+        '</div>' +
+        '<div class="' + NS + '-pack-bar"><div class="' + NS + '-pack-fill"></div></div>' +
+        '<div class="' + NS + '-pack-detail"></div>';
+      document.documentElement.appendChild(packEl);
+      packTxt = packEl.querySelector('.' + NS + '-pack-txt');
+      packFill = packEl.querySelector('.' + NS + '-pack-fill');
+      packDetail = packEl.querySelector('.' + NS + '-pack-detail');
+      packCtrl = packEl.querySelector('.' + NS + '-pack-cancel');
+      packCtrl.addEventListener('click', () => {
+        if (packAbort) { packAbort.abort(); packAbort = null; }
+      });
+    }
+
+    function packShow(msg, ratio) {
+      ensurePackUI();
+      packEl.classList.add(NS + '-on');
+      packTxt.textContent = msg;
+      packDetail.textContent = '';
+      if (typeof ratio === 'number') packFill.style.width = Math.round(ratio * 100) + '%';
+    }
+    function packDetailSet(lines) {
+      if (!packDetail) return;
+      packDetail.textContent = lines.join('\n');
+    }
+    function packFinishDelay(ms) {
+      setTimeout(() => {
+        if (packEl) packEl.classList.remove(NS + '-on');
+        packAbort = null;
+      }, ms || 4000);
+    }
+
+    /**
+     * 打包下载。
+     * @param {'group'|'all'} mode
+     */
+    async function packDownload(mode) {
+      if (packAbort) { toast('已有打包任务在进行'); return; }
+      // 取快照：组模式只取当前组，全部模式取整池。
+      // ⚠️ 必须 slice()：打包期间用户可能切图/换组，不能让下载过程读可变状态。
+      const list = mode === 'group' ? items.slice() : ImagePool.items.slice();
+      if (!list.length) { toast('没有可下载的图片'); return; }
+
+      const label = mode === 'group' ? '本组' : '全部';
+      const ctrl = new AbortController();
+      packAbort = ctrl;
+      packShow('准备打包' + label + ' · 共 ' + list.length + ' 张', 0);
+
+      let res;
+      try {
+        res = await ImageDownloader.download(list, {
+          zipName: (document.title || 'images').slice(0, 60) + '_' + label,
+          signal: ctrl.signal,
+          onProgress: (done, total, phase) => {
+            if (phase === 'zip') {
+              packShow('正在打包 ' + total + ' 张…', 1);
+            } else {
+              packShow('正在获取 ' + done + '/' + total + ' 张…',
+                total ? (done / total) * 0.95 : 0);
+            }
+          }
+        });
+      } catch (e) {
+        packAbort = null;
+        packShow('打包失败：' + ((e && e.message) || e), 0);
+        packFinishDelay(5000);
+        return;
+      }
+      packAbort = null;
+
+      if (res.cancelled) {
+        packShow('已取消', 0);
+        packFinishDelay(2600);
+        return;
+      }
+
+      if (!res.ok) {
+        packShow('没有可打包的图片（全部获取失败）', 0);
+        packDetailSet(res.failed.slice(0, 20).map((f) => '× ' + shortSrc(f.item) + ' — ' + f.reason));
+        packFinishDelay(6000);
+        return;
+      }
+
+      const sizeMb = (res.bytes / 1048576).toFixed(1);
+      packShow('✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB', 1);
+      if (res.failed.length) {
+        packDetailSet(
+          ['⚠️ 有 ' + res.failed.length + ' 张未能获取：']
+            .concat(res.failed.slice(0, 20).map((f) => '× ' + shortSrc(f.item) + ' — ' + f.reason))
+            .concat(res.failed.length > 20 ? ['… 其余 ' + (res.failed.length - 20) + ' 张略'] : [])
+        );
+      }
+      packFinishDelay(res.failed.length ? 9000 : 4000);
+    }
+
+    /** 失败清单里展示用的精简地址 */
+    function shortSrc(it) {
+      const s = (it && it.src) || '';
+      return s.length > 70 ? s.slice(0, 67) + '…' : s;
+    }
+
     async function copyCurrentLink() {
       const it = current(); if (!it) return;
       try {
@@ -2887,6 +3382,11 @@ kbd.${NS}-kbd {
         const act = btn.dataset.act;
         if (act === 'close') close();
         else if (act === 'download') downloadCurrent();
+        else if (act === 'pack-group') {
+          // 「本组」只在分组浏览态下有意义；全局浏览时降级为「全部」并明确告知
+          if (!scope) { toast('当前未进入分组，改为打包全部图片'); packDownload('all'); }
+          else packDownload('group');
+        }
         else if (act === 'copy') copyCurrentLink();
         else if (act === 'open') openCurrentInTab();
         else if (act === 'play') toggleAutoplay();
@@ -3108,6 +3608,14 @@ kbd.${NS}-kbd {
       if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
       const k = e.key;
       let handled = true;
+      // ⚠️ 打包下载用 Shift+D，必须在 switch 之前拦截：
+      //    单独按 D 已被「下一张」占用（case 'd'），走到那里就轮不到 Shift 组合了。
+      if (e.shiftKey && (k === 'D' || k === 'd')) {
+        if (scope) packDownload('group');
+        else { toast('当前未进入分组，改为打包全部图片'); packDownload('all'); }
+        e.preventDefault(); e.stopPropagation();
+        return;
+      }
       switch (k) {
         case 'Escape':
           // 分组浏览时：第一下 Esc 退出分组回到全部，第二下才关闭浏览器。
@@ -3165,6 +3673,8 @@ kbd.${NS}-kbd {
       get itemCount() { return items.length; },
       /* —— 组间导航 —— */
       navNext, navPrev, gotoAdjacentGroup,
+      /* —— 批量打包下载 —— */
+      packDownload,
       get groupCount() { return ImagePool.groups(2).length; }
     };
   })();
@@ -3844,6 +4354,15 @@ kbd.${NS}-kbd {
         Floating.refresh();
         if (window.__fivToast) window.__fivToast('本次新增 ' + n + ' 张，共 ' + ImagePool.count + ' 张');
       });
+      // 打包下载：浏览层未打开时也能用（此时「本组」无从谈起，一律打包全部）
+      GM_registerMenuCommand('📦 打包下载全部图片', () => {
+        if (!ImagePool.count) { if (window.__fivToast) window.__fivToast('没有可下载的图片'); return; }
+        if (window.__fivPack) window.__fivPack('all');
+      });
+      GM_registerMenuCommand('📦 打包下载当前组', () => {
+        if (!ImagePool.count) { if (window.__fivToast) window.__fivToast('没有可下载的图片'); return; }
+        if (window.__fivPack) window.__fivPack('group');
+      });
     } catch (e) {}
   }
 
@@ -3874,6 +4393,8 @@ kbd.${NS}-kbd {
     // 全局回调（供内部模块互通）
     window.__fivOpenSettings = () => Settings.show();
     window.__fivRefreshFab = () => Floating.refresh();
+    // 供油猴菜单命令调用（菜单注册在 boot 层，拿不到 Viewer 内部函数）
+    window.__fivPack = (mode) => packDownload(mode === 'group' ? 'group' : 'all');
     /**
      * 调试/扩展入口：把内部模块挂到 window.__fiv。
      * 方便在控制台排查站点适配问题（如 __fiv.ImagePool.groupOf(img) 看分组结果），
@@ -3887,6 +4408,7 @@ kbd.${NS}-kbd {
     window.__fiv.Config = Config;
     window.__fiv.Settings = Settings;
     window.__fiv.HoverBadge = HoverBadge;
+    window.__fiv.ImageDownloader = ImageDownloader;
     /** 分组枚举（调试用） */
     window.__fiv.groups = () => ImagePool.groups(2);
     // URL 安全判定（排查站点适配问题时可即时验证某个地址是否被允许）
