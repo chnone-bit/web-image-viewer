@@ -25,11 +25,11 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **1.6.0** |
+| 当前版本 | **1.6.1** |
 | 脚本文件 | `web-image-viewer.user.js` |
-| 文件行数 | ~4490 |
+| 文件行数 | ~4530 |
 | 匹配范围 | `*://*/*`（全站可用，含白名单模式） |
-| 测试套件 | 11 个，合计 **289 项断言全绿** |
+| 测试套件 | 12 个，合计 **314 项断言全绿** |
 | 定位 | 通用网页图片组浏览 + 批量打包下载；论坛场景为最优适配对象 |
 | 计划中 | 跨域降级（`GM_xmlhttpRequest`）、超阈值分卷 ZIP |
 
@@ -54,7 +54,79 @@
 
 ## 版本历史
 
-### v1.6.0 — 批量打包下载（当前版本）
+### v1.6.1 — 缩略图条跟随修复（当前版本）
+
+用户报告两个现象：**焦点缩略图跑到显示范围之外**、**缩略图数量与实际可浏览数不符**。
+排查后发现是**同一个根因的两面**。
+
+#### 🐛 根因：`show()` 只改高亮，从不滚动缩略图条
+
+切图时 `show()` 调了 `updateStripCurrent()`（改高亮）和 `updateMinimap()`（改迷你进度条），
+但**唯独没调 `scrollStripTo()`**。而 `scrollStripTo` 全代码只有两处调用：
+
+| 位置 | 触发时机 |
+|---|---|
+| `renderStrip()` 末尾 | 打开浏览器 / 配置变更时重建缩略条 |
+| `window.resize` 降级处理 | 拖动窗口大小 |
+
+→ **正常翻图时根本不滚动**。高亮跑到了当前图，缩略条却留在原处，焦点直接跑出视野。
+
+#### 🐛 第二个现象的成因：虚拟化窗口不跟随 index
+
+图片数 > 120 时走虚拟化，只渲染 `computeVirtualWindow()` 算出的窗口。
+这个函数依赖 `index`，但**只在 `renderStrip()` 时算一次** —— 翻图时不重算。
+
+所以大批量场景下：滑到第 190 张，但条里渲染的还是旧窗口那一段，
+**看起来就像「数量和实际对不上」**。
+
+#### ✅ 修复
+
+新增 `ensureThumbVisible()`，在 `show()` 里**先补渲染、再高亮、再滚动**：
+
+```js
+function ensureThumbVisible() {
+  if (!track || !Config.get('thumbnailBar')) return;
+  const i = index;
+  let el = track.querySelector('.${NS}-thumb[data-i="' + i + '"]');
+  if (!el) {
+    // 情况 1：虚拟窗口没覆盖当前图 → 重算窗口并重渲染
+    renderStrip();
+    el = track.querySelector('.${NS}-thumb[data-i="' + i + '"]');
+    if (!el) return;                       // 兜底：不阻断切图
+    scrollStripTo(i, false);
+    return;
+  }
+  // 情况 2：已渲染但不可见 → 滚过去
+  const viewL = track.scrollLeft;
+  const viewR = viewL + track.clientWidth;
+  const left = el.offsetLeft, right = left + el.offsetWidth;
+  if (left < viewL || right > viewR) scrollStripTo(i, false);
+}
+```
+
+两个设计要点：
+
+1. **只在真的不可见时才滚**。若当前图已在视野内则不动 —— 否则每翻一张都甩一下镜头。
+2. **同时移除了 `renderStrip()` 末尾那次无条件 `scrollStripTo(index, true)`**。
+   虚拟化下翻图会频繁重建缩略条，无条件滚动会导致镜头乱甩。现在滚动职责统一收敛到 `ensureThumbVisible()`。
+
+#### 🧪 测试：新增 `verify-strip.js`（25 项）
+
+全套 **12 套件 / 314 项断言全绿**。
+
+> **测试踩坑记录（jsdom 布局模拟）**：这个 bug 测不出来，是因为 jsdom 的
+> `offsetLeft` / `clientWidth` 恒为 0。补桩时连踩三层坑：
+> 1. `offsetLeft` 是**实例级**可覆盖的，挂在 `Element.prototype` 上**无效**；
+> 2. 但实例级桩会随 `renderStrip()` 的 `track.innerHTML=''` **一起被丢弃**
+>    —— 虚拟化下每次翻图都重建全部 thumb；
+> 3. 最终方案是**劫持 `document.createElement`**，让新建的 thumb 一出生就带上桩。
+>
+> 顺带修了一条**自己写错的断言**：`k*10` 在 k=20 时是 200，被 `clamp` 到 199，
+> 期望值却写成 190。用探针打印每步的 `index/cur/rendered/scrollLeft` 才定位到。
+
+---
+
+### v1.6.0 — 批量打包下载
 
 把 v1.5.0 时期那份「已评审未实现」的规划落地。**评审结论全部采纳**，包括那 3 处技术修正与 5 项遗漏补充。
 
@@ -921,7 +993,8 @@ ImageDownloader（独立模块，单向依赖 ImagePool.items）
 | `verify-batch4.js` | 29 | **v1.4 增量扫描 / 准入过滤 / 虚拟缩略图 / 死代码** |
 | `verify-batch5.js` | 34 | **v1.5 角标稳定性 / 缩略条拖动与点选（含 CSS 命中测试模拟） / 分组枚举 / 组间续览** |
 | `verify-download.js` | 69 | **v1.6 打包下载：ZIP 结构与 CRC 基准校验 / 文件名生成与清洗 / 失败清单 / 取消 / 池状态隔离 / UI 接线** |
-| **合计** | **289** | **失败 0** |
+| `verify-strip.js` | 25 | **v1.6.1 缩略图条跟随：滚动进视野 / 虚拟窗口跟随 index / 序号与实际数量一致 / 关闭条边界** |
+| **合计** | **314** | **失败 0** |
 
 运行方式：
 
@@ -971,4 +1044,4 @@ v1.5.0 曾尝试左侧树形目录作为组间跳转入口，因体验不佳于 
 
 ---
 
-*文档最后更新：对应脚本版本 1.6.0*
+*文档最后更新：对应脚本版本 1.6.1*

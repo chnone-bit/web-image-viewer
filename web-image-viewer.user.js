@@ -2,7 +2,7 @@
 // @name         网页图片浏览器
 // @name:en      Web Image Viewer
 // @namespace    local.web.imageviewer
-// @version      1.6.0
+// @version      1.6.1
 // @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，失败清单）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark
 // @match        *://*/*
@@ -24,7 +24,7 @@
    * ========================================================================= */
 
   const NS = 'fiv';                     // 命名空间前缀
-  const VERSION = '1.6.0';              // 与头部 @version 保持一致
+  const VERSION = '1.6.1';              // 与头部 @version 保持一致
   const Z_BASE = 2147483000;            // 遮罩层级
   const LOG_PREFIX = '[图片浏览器]';
 
@@ -2686,6 +2686,9 @@ kbd.${NS}-kbd {
       updateMeta();
       updateNavDisabled();
       markSeen(it);
+      // ⚠️ 顺序有讲究：先补渲染（虚拟化窗口可能不含当前图），再高亮 + 滚动。
+      //    少了 scrollStripTo() 就会出现「高亮跑到缩略图条的显示范围之外」。
+      ensureThumbVisible();
       updateStripCurrent();
       updateMinimap();
 
@@ -3000,6 +3003,37 @@ kbd.${NS}-kbd {
       showUI(false);
     }
 
+    /**
+     * 确保当前图对应的缩略图在视野内。**每次切图都要调**。
+     *
+     * 两种情况要分别处理：
+     *  1. **虚拟化窗口不含当前下标**（>120 张且跳得较远）。
+     *     此时 track 里根本没有那个 thumb，必须按新下标重算窗口并重渲染，
+     *     否则会出现「条里根本没有当前图」= 数量与实际浏览数对不上。
+     *  2. **窗口含但不在视野内**。滚过去即可。
+     *
+     * 只滚动不定居中：若当前图已经可见则不动，避免每翻一张都甩一下镜头。
+     */
+    function ensureThumbVisible() {
+      if (!track || !Config.get('thumbnailBar')) return;
+      const i = index;
+      let el = track.querySelector('.' + NS + '-thumb[data-i="' + i + '"]');
+      if (!el) {
+        // 情况 1：虚拟窗口没覆盖当前图 → 重算窗口并重渲染
+        renderStrip();
+        el = track.querySelector('.' + NS + '-thumb[data-i="' + i + '"]');
+        if (!el) return;   // 兜底：仍找不到就放弃滚动，不阻断切图
+        scrollStripTo(i, false);
+        return;
+      }
+      // 情况 2：已渲染但可能不可见 → 判断后滚动
+      const viewL = track.scrollLeft;
+      const viewR = viewL + track.clientWidth;
+      const left = el.offsetLeft;
+      const right = left + el.offsetWidth;
+      if (left < viewL || right > viewR) scrollStripTo(i, false);
+    }
+
     /* ---------------- 缩略图条 ---------------- */
 
     function applyStripLayout() {
@@ -3031,7 +3065,9 @@ kbd.${NS}-kbd {
       track.appendChild(frag);
       updateStripCurrent();
       updateMinimap();
-      scrollStripTo(index, true);
+      // 注意：这里**不**调 scrollStripTo。滚动统一由 ensureThumbVisible() 负责，
+      // 它会先判断「是否真的不可见」，只有需要时才滚。渲染时无条件滚动
+      // 会导致每次重建缩略条都甩一下镜头（虚拟化下翻图会频繁重建）。
     }
 
     /** 构建单个缩略图（序号角标 + 已看小点 + 悬停预览） */
