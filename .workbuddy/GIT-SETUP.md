@@ -38,7 +38,7 @@ cd "C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29"
 git add .
 git commit -m "chore: 初始化版本库（v1.5.1）
 
-- forum-image-viewer.user.js: 论坛图片浏览器油猴脚本
+- web-image-viewer.user.js: 网页图片浏览器油猴脚本
 - CHANGELOG.md: 版本改动记录
 - .workbuddy/test/: jsdom 测试套件（10 套 / 218 断言）
 - test-demo.html: 演示页
@@ -59,7 +59,7 @@ git status                 # 应为 clean
 ```bash
 git status                          # 看改了什么
 git diff                            # 看具体改动
-git add forum-image-viewer.user.js  # 只暂存某个文件
+git add web-image-viewer.user.js  # 只暂存某个文件
 git commit -m "fix: xxx"            # 提交
 git log --oneline -10               # 近期历史
 ```
@@ -75,7 +75,7 @@ git add -A && git commit -m "wip: 改动前快照"
 一旦改崩了，一条命令回滚：
 
 ```bash
-git restore forum-image-viewer.user.js      # 丢弃未提交的改动
+git restore web-image-viewer.user.js      # 丢弃未提交的改动
 # 或
 git reset --hard HEAD                       # 回到上次提交（危险，会丢未提交内容）
 ```
@@ -89,7 +89,7 @@ git reset --hard HEAD                       # 回到上次提交（危险，会�
 
 | 路径 | 是否入库 | 原因 |
 |---|---|---|
-| `forum-image-viewer.user.js` | ✅ | 主交付物 |
+| `web-image-viewer.user.js` | ✅ | 主交付物 |
 | `CHANGELOG.md` | ✅ | 版本记录 |
 | `.workbuddy/test/` | ✅ | 测试是代码资产 |
 | `test-demo.html` | ✅ | 演示页 |

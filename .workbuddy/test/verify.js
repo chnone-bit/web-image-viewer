@@ -5,7 +5,7 @@
 const fs = require('fs');
 const { JSDOM } = require('jsdom');
 
-const CODE = fs.readFileSync('C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29/forum-image-viewer.user.js', 'utf8');
+const CODE = fs.readFileSync('C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29/web-image-viewer.user.js', 'utf8');
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra) => {

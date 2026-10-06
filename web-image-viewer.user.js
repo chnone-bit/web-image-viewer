@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         论坛图片浏览器
-// @name:en      Forum Image Viewer
-// @namespace    local.forum.imageviewer
+// @name         网页图片浏览器
+// @name:en      Web Image Viewer
+// @namespace    local.web.imageviewer
 // @version      1.5.1
 // @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark

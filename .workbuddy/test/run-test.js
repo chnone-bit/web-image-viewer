@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('jsdom');
 
-const SCRIPT = path.join('C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29', 'forum-image-viewer.user.js');
+const SCRIPT = path.join('C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29', 'web-image-viewer.user.js');
 const code = fs.readFileSync(SCRIPT, 'utf8');
 
 /* ---------- 构造模拟论坛页面 ---------- */

@@ -1,6 +1,6 @@
-# 论坛图片浏览器 · 版本改动记录
+# 网页图片浏览器 · 版本改动记录
 
-> 油猴脚本 `forum-image-viewer.user.js`
+> 油猴脚本 `web-image-viewer.user.js`
 > 从「论坛帖子看图」逐步收敛为「通用网页图片组浏览」。
 > 本文档记录每个版本的改动、设计决策、已知取舍与后续待办。
 
@@ -26,6 +26,7 @@
 | 项 | 值 |
 |---|---|
 | 当前版本 | **1.5.1** |
+| 脚本文件 | `web-image-viewer.user.js` |
 | 文件行数 | ~3950 |
 | 匹配范围 | `*://*/*`（全站可用，含白名单模式） |
 | 测试套件 | 10 个，合计 **218 项断言全绿** |
@@ -51,6 +52,31 @@
 ---
 
 ## 版本历史
+
+### 重命名 — forum-image-viewer → web-image-viewer（无版本号变更）
+
+脚本已从「论坛看图」收敛为「通用网页图片组浏览」，文件名与元信息同步对齐。
+
+| 项 | 旧值 | 新值 |
+|---|---|---|
+| 文件名 | `forum-image-viewer.user.js` | `web-image-viewer.user.js` |
+| `@name` | 论坛图片浏览器 | 网页图片浏览器 |
+| `@name:en` | Forum Image Viewer | Web Image Viewer |
+| `@namespace` | `local.forum.imageviewer` | `local.web.imageviewer` |
+| `@version` | 1.5.1 | **1.5.1（不变）** |
+| CHANGELOG 标题 | 论坛图片浏览器 | 网页图片浏览器 |
+
+**同时更新的引用点**（重命名必须成对处理，否则测试会找不到脚本）：
+
+- `.workbuddy/test/` 下 **12 个测试脚本**硬编码的脚本路径：`forum-image-viewer.user.js` → `web-image-viewer.user.js`
+- `.workbuddy/GIT-SETUP.md`：4 处路径示例与描述
+
+**验证**：重命名后重跑全套 10 个测试套件，**218 项断言全绿**，与重命名前一致（26+8+28+21+21+15+29+32+19+19）。
+
+> 备注：`@version` 未 bump —— 此改动不涉及功能，仅是标识对齐；且脚本尚未通过 `@updateURL` 发布，无升级链需要考虑。
+> 后续如要实现自动更新，应补 `@downloadURL` / `@updateURL` 指向 GitHub raw 地址。
+
+---
 
 ### v1.5.1 — 缩略图点选修复 · 移除分组目录（当前版本）
 

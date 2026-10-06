@@ -12,7 +12,7 @@
  */
 const fs = require('fs');
 const { JSDOM } = require('jsdom');
-const SRC = 'C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29/forum-image-viewer.user.js';
+const SRC = 'C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29/web-image-viewer.user.js';
 const CODE = fs.readFileSync(SRC, 'utf8');
 
 let pass = 0, fail = 0;

@@ -4,7 +4,7 @@
  */
 const fs = require('fs');
 const { JSDOM } = require('jsdom');
-const CODE = fs.readFileSync('C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29/forum-image-viewer.user.js', 'utf8');
+const CODE = fs.readFileSync('C:/Users/lidt/WorkBuddy/2026-10-05-16-56-29/web-image-viewer.user.js', 'utf8');
 
 const dom = new JSDOM(`<!DOCTYPE html><html><body>
   <div class="post"><div class="message"><img id="i1" src="https://x.com/a.jpg"></div></div>
