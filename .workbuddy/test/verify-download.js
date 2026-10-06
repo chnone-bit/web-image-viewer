@@ -393,6 +393,17 @@ const enc = (s) => new TextEncoder().encode(s);
     w.GM_setValue = () => {}; w.GM_getValue = () => undefined; w.GM_deleteValue = () => {};
     w.GM_addStyle = () => {};
     w.GM_registerMenuCommand = (name, fn) => cmds.push({ name, fn });
+    w.URL.createObjectURL = () => 'blob:mock';
+    w.URL.revokeObjectURL = () => {};
+    w.__dl = [];
+    const oc = w.HTMLAnchorElement.prototype.click;
+    w.HTMLAnchorElement.prototype.click = function () {
+      if (this.download) { w.__dl.push(this.download); return; }
+      return oc.call(this);
+    };
+    w.fetch = async () => new globalThis.Response(new Uint8Array([1, 2]), {
+      status: 200, headers: { 'content-type': 'image/jpeg' }
+    });
     w.eval(CODE);
     await sleep(500);
     ok('注册了菜单命令', cmds.length >= 4, 'count=' + cmds.length);
@@ -400,6 +411,85 @@ const enc = (s) => new TextEncoder().encode(s);
       cmds.map((c) => c.name).join(' | '));
     ok('有「打包下载当前组」菜单', cmds.some((c) => /打包下载当前组/.test(c.name)),
       cmds.map((c) => c.name).join(' | '));
+
+    // ⚠️ 回归：菜单命令实际调用 window.__fivPack。
+    //    曾经踩过的坑：__fivPack 写成箭头函数直接引用 packDownload，
+    //    而 packDownload 定义在 Viewer 的闭包里 → ReferenceError，菜单完全失效。
+    const packAll = cmds.find((c) => /打包下载全部/.test(c.name));
+    let menuErr = null;
+    try { await packAll.fn(); } catch (e) { menuErr = e; }
+    await sleep(300);
+    ok('点击菜单命令不抛异常', !menuErr, menuErr ? menuErr.constructor.name + ': ' + menuErr.message : '');
+    ok('菜单命令真的产出了下载', w.__dl.length === 1, 'downloads=' + w.__dl.length);
+  }
+
+  console.log('\n【回归】__fivPack 作用域（曾抛 ReferenceError）');
+  {
+    const { w } = await withPage(THREE_GROUPS);
+    let err = null;
+    try { await w.__fivPack('all'); } catch (e) { err = e; }
+    await sleep(200);
+    ok('__fivPack("all") 不抛异常', !err, err ? err.message : '');
+    ok('__fivPack 真的触发了下载', w.__downloads.length === 1, 'downloads=' + w.__downloads.length);
+    const before = w.__downloads.length;
+    try { await w.__fivPack('group'); } catch (e) { err = e; }
+    await sleep(200);
+    ok('__fivPack("group") 不抛异常', !err, err ? err.message : '');
+    ok('__fivPack("group") 也触发下载', w.__downloads.length === before + 1,
+      'before=' + before + ' now=' + w.__downloads.length);
+  }
+
+  console.log('\n【体验】全部失败时必须明确告知原因（不能"点了没反应"）');
+  {
+    const { w, V } = await withPage(THREE_GROUPS);
+    // 模拟跨域被拦：fetch 抛 TypeError（真实浏览器里是 "Failed to fetch"）
+    w.__fetchImpl = async () => { throw new TypeError('Failed to fetch'); };
+    V.openAt(0);
+    await sleep(100);
+    V.packDownload('all');
+    await sleep(400);
+    const panel = w.document.querySelector('.fiv-pack');
+    ok('失败时进度面板仍然出现', !!panel && panel.classList.contains('fiv-on'),
+      panel ? panel.className : '无面板');
+    const txt = panel ? panel.querySelector('.fiv-pack-txt').textContent : '';
+    ok('文案说明「全部获取失败」而非沉默', /全部.*获取失败/.test(txt), txt);
+    ok('文案给出跨域原因提示', /跨域|CORS/.test(txt), txt);
+    const detail = panel ? panel.querySelector('.fiv-pack-detail').textContent : '';
+    ok('列出失败清单与原因', /Failed to fetch/.test(detail), detail.slice(0, 80));
+  }
+
+  console.log('\n【体验】部分失败也要展示「成功 + 失败」两件事');
+  {
+    const { w, V } = await withPage(THREE_GROUPS);
+    let n = 0;
+    w.__fetchImpl = async () => {
+      n++;
+      if (n % 2 === 0) throw new TypeError('Failed to fetch');
+      return new globalThis.Response(enc('A'), { status: 200, headers: { 'content-type': 'image/jpeg' } });
+    };
+    V.openAt(0);
+    await sleep(100);
+    V.packDownload('all');
+    await sleep(500);
+    const panel = w.document.querySelector('.fiv-pack');
+    const txt = panel ? panel.querySelector('.fiv-pack-txt').textContent : '';
+    ok('显示成功张数', /已打包\s*2\s*张/.test(txt), txt);
+    // ⚠️ 主文案必须同时带失败数，否则用户会以为另外 2 张不存在
+    ok('主文案同时告知失败张数', /2\s*张失败/.test(txt), txt);
+    const detailTxt = panel ? panel.querySelector('.fiv-pack-detail').textContent : '';
+    ok('失败明细可查', /有\s*2\s*张未能获取/.test(detailTxt), detailTxt.slice(0, 80));
+  }
+
+  console.log('\n【诊断】__fiv.diagPack 排障入口');
+  {
+    const { w } = await withPage(THREE_GROUPS);
+    ok('__fiv.diagPack 已暴露', typeof w.__fiv.diagPack === 'function');
+    let rows = null, err = null;
+    try { rows = await w.__fiv.diagPack('all'); } catch (e) { err = e; }
+    ok('diagPack 可执行不抛异常', !err, err ? err.message : '');
+    ok('逐张返回诊断结果', Array.isArray(rows) && rows.length === 4, 'rows=' + (rows ? rows.length : 'null'));
+    ok('结果含 status/ok 字段', !!(rows && rows[0] && 'status' in rows[0] && 'ok' in rows[0]),
+      rows && rows[0] ? JSON.stringify(rows[0]) : '');
   }
 
   console.log('\n【安全边界】模块不引入新的 @grant');

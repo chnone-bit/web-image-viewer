@@ -2,7 +2,7 @@
 // @name         网页图片浏览器
 // @name:en      Web Image Viewer
 // @namespace    local.web.imageviewer
-// @version      1.6.1
+// @version      1.6.2
 // @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，失败清单）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark
 // @match        *://*/*
@@ -24,7 +24,7 @@
    * ========================================================================= */
 
   const NS = 'fiv';                     // 命名空间前缀
-  const VERSION = '1.6.1';              // 与头部 @version 保持一致
+  const VERSION = '1.6.2';              // 与头部 @version 保持一致
   const Z_BASE = 2147483000;            // 遮罩层级
   const LOG_PREFIX = '[图片浏览器]';
 
@@ -2089,7 +2089,11 @@ img.${NS}-hot { outline: 2px solid var(--fiv-accent, #2563eb); outline-offset: 2
 }
 .${NS}-pack.${NS}-on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
 .${NS}-pack-row { display: flex; align-items: center; gap: 10px; }
-.${NS}-pack-txt { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.${NS}-pack-txt {
+  flex: 1 1 auto; min-width: 0;
+  white-space: pre-line;      /* 支持多行提示（跨域原因说明用） */
+  overflow: hidden; text-overflow: ellipsis;
+}
 .${NS}-pack-cancel {
   flex: 0 0 auto; cursor: pointer;
   padding: 4px 10px; border-radius: 6px;
@@ -3326,14 +3330,32 @@ kbd.${NS}-kbd {
       }
 
       if (!res.ok) {
-        packShow('没有可打包的图片（全部获取失败）', 0);
+        // 全部失败是最需要说清楚的一种情况：用户点了按钮却什么都没拿到。
+        // 必须把「为什么」直接摆在界面上，否则等同于没反应。
+        const first = res.failed[0];
+        let hint = '';
+        if (first) {
+          const r = first.reason || '';
+          if (/Failed to fetch|NetworkError|load failed/i.test(r)) {
+            hint = '\n可能原因：图片跨域，浏览器不允许脚本读取（需要 GM_xmlhttpRequest 才能绕过）。';
+          } else if (/^HTTP 4/.test(r)) {
+            hint = '\n可能原因：图片需要登录态或已失效（404/403）。';
+          } else if (/超时|abort/i.test(r)) {
+            hint = '\n可能原因：网络过慢，单张超过 20 秒未响应。';
+          }
+        }
+        packShow('全部 ' + res.failed.length + ' 张都获取失败' + hint, 0);
         packDetailSet(res.failed.slice(0, 20).map((f) => '× ' + shortSrc(f.item) + ' — ' + f.reason));
-        packFinishDelay(6000);
+        packFinishDelay(10000);
         return;
       }
 
       const sizeMb = (res.bytes / 1048576).toFixed(1);
-      packShow('✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB', 1);
+      // ⚠️ 主文案必须同时报成功与失败数：只写「已打包 2 张」会让用户以为另外 2 张
+      //    根本不存在，误以为功能有问题。失败明细在下方，但主文案要给出全貌。
+      packShow(res.failed.length
+        ? '✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB（' + res.failed.length + ' 张失败，见下方）'
+        : '✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB', 1);
       if (res.failed.length) {
         packDetailSet(
           ['⚠️ 有 ' + res.failed.length + ' 张未能获取：']
@@ -4429,8 +4451,10 @@ kbd.${NS}-kbd {
     // 全局回调（供内部模块互通）
     window.__fivOpenSettings = () => Settings.show();
     window.__fivRefreshFab = () => Floating.refresh();
-    // 供油猴菜单命令调用（菜单注册在 boot 层，拿不到 Viewer 内部函数）
-    window.__fivPack = (mode) => packDownload(mode === 'group' ? 'group' : 'all');
+    // 供油猴菜单命令调用（菜单注册在 boot 层，拿不到 Viewer IIFE 内部的 packDownload）
+    // ⚠️ 必须走 Viewer.packDownload —— packDownload 本身定义在 Viewer 的闭包里，
+    //    在此直接引用会抛 ReferenceError: packDownload is not defined。
+    window.__fivPack = (mode) => Viewer.packDownload(mode === 'group' ? 'group' : 'all');
     /**
      * 调试/扩展入口：把内部模块挂到 window.__fiv。
      * 方便在控制台排查站点适配问题（如 __fiv.ImagePool.groupOf(img) 看分组结果），
@@ -4445,6 +4469,49 @@ kbd.${NS}-kbd {
     window.__fiv.Settings = Settings;
     window.__fiv.HoverBadge = HoverBadge;
     window.__fiv.ImageDownloader = ImageDownloader;
+    /**
+     * 打包下载诊断（排障用）。
+     * 在控制台执行 `__fiv.diagPack()`，会**逐张**真实 fetch 当前组图片，
+     * 把每一步的成败与原因打到 console，并返回一个汇总 Promise。
+     *
+     * 存在的意义：批量下载在 jsdom 里无法验证真实网络行为（尤其是 CORS），
+     * 有了它，「点了没反应」就能立刻定位到具体是哪一张、什么原因。
+     */
+    window.__fiv.diagPack = async function (mode) {
+      const list = (mode === 'group' && Viewer.inGroup)
+        ? null   // 分组快照在 Viewer 内部，这里用全部即可，诊断目的相同
+        : ImagePool.items.slice();
+      const items = list || ImagePool.items.slice();
+      const group = LOG_PREFIX + ' [打包诊断] 共 ' + items.length + ' 张';
+      console.log(group);
+      if (!items.length) { console.warn(group, '图片池为空'); return; }
+      const rows = [];
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const line = { i: i + 1, src: it.src };
+        try {
+          const resp = await fetch(it.src, { credentials: 'include', referrerPolicy: 'no-referrer', cache: 'force-cache' });
+          line.status = resp.status;
+          line.ok = resp.ok;
+          line.mime = resp.headers.get('content-type');
+          const buf = await resp.arrayBuffer();
+          line.bytes = buf.byteLength;
+          console.log('✅', line.i, line.status, line.mime, line.bytes + 'B', it.src);
+        } catch (e) {
+          line.error = (e && e.message) || String(e);
+          console.warn('❌', line.i, line.error, it.src);
+        }
+        rows.push(line);
+      }
+      const bad = rows.filter((r) => !r.ok);
+      console.log('%c[打包诊断] 完成：成功 %d / 失败 %d',
+        'color:' + (bad.length ? '#c00' : '#0a0'), rows.length - bad.length, bad.length);
+      if (bad.length) {
+        console.warn('[打包诊断] 失败多半是跨域被 CORS 拦住。'
+          + '浏览器允许 <img> 跨域显示，但不允许 fetch 读取内容。');
+      }
+      return rows;
+    };
     /** 分组枚举（调试用） */
     window.__fiv.groups = () => ImagePool.groups(2);
     // URL 安全判定（排查站点适配问题时可即时验证某个地址是否被允许）
