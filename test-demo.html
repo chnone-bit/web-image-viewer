@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图片浏览器 · 本地自测页</title>
+<style>
+  :root{
+    --primary-color:#c0392b;   /* 故意设一个「论坛主色」用来验证主题自适应 */
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;padding:0 0 120px;
+    font:14px/1.7 -apple-system,"Microsoft YaHei",sans-serif;
+    background:#f6f7f9;color:#222;
+  }
+  .wrap{max-width:880px;margin:0 auto;background:#fff;padding:0 30px 40px}
+  .topbar{background:#c0392b;color:#fff;padding:14px 30px;font-weight:700;border-radius:0 0 10px 10px}
+  h1{font-size:20px;margin:22px 0 6px}
+  .crumb{color:#888;font-size:12px;margin-bottom:18px}
+  .card{border:1px solid #e5e7eb;border-radius:10px;padding:16px;margin:14px 0;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+  .post-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .avatar{width:40px;height:40px;border-radius:50%;background:#c0392b;color:#fff;display:grid;place-items:center;font-weight:700;overflow:hidden}
+  .avatar img{width:40px;height:40px;object-fit:cover}
+  .nick{font-weight:600;color:#c0392b}
+  .floor{margin-left:auto;color:#aaa;font-size:12px}
+  .message{font-size:15px;line-height:1.8}
+  .message img{max-width:100%;height:auto;border-radius:8px;margin:10px 0;cursor:zoom-in;display:block}
+  .toolbar{position:fixed;left:0;right:0;bottom:0;background:#1f2430;color:#fff;padding:10px 18px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;font-size:13px;z-index:50}
+  .toolbar button{background:#c0392b;border:none;color:#fff;padding:8px 14px;border-radius:8px;cursor:pointer;font-weight:600}
+  .toolbar button.alt{background:#3b4252}
+  .toolbar .tip{opacity:.7}
+  .smiley{display:inline-block;width:20px;height:20px;vertical-align:-4px}
+  .signature{margin-top:14px;padding-top:10px;border-top:1px dashed #e5e7eb;color:#999;font-size:12px}
+  .signature img{width:120px;height:30px}
+  .adslot{margin:14px 0;text-align:center}
+  .adslot img{width:468px;height:60px;border:1px dashed #f0b27a}
+  .dim{font-size:11px;color:#9ca3af;margin:-4px 0 12px}
+</style>
+</head>
+<body>
+
+<div class="topbar">【自测】某论坛 · 图片浏览测试帖</div>
+
+<div class="wrap">
+  <h1>晒图专帖：这次的旅行照片全在这里了</h1>
+  <div class="crumb">楼主：测试账号 ｜ 查看 12345 ｜ 回复 88</div>
+
+  <!-- 广告位：应被过滤 -->
+  <div class="adslot"><img src="https://picsum.photos/seed/ad468/468/60" alt="advertisement banner logo"></div>
+
+  <div class="card post" id="floor1">
+    <div class="post-head">
+      <span class="avatar" id="avatar1"></span>
+      <span class="nick">测试账号</span>
+      <span class="floor">1 楼</span>
+    </div>
+    <div class="message">
+      <p>先发几张手机随手拍的，后面陆续更新。表情包先来一个：<img class="smiley" src="" alt="smiley emoji"> 还有头像混在里面。</p>
+      <img src="https://picsum.photos/seed/a1/1600/900" alt="风景 1">
+      <div class="dim">↑ 1600×900 宽图</div>
+      <img src="https://picsum.photos/seed/a2/900/1600" alt="竖构图 2">
+      <div class="dim">↑ 900×1600 长图</div>
+      <img src="https://picsum.photos/seed/a3/300/220" alt="小图 3">
+      <div class="dim">↑ 300×220 会被默认阈值过滤（200×200 以上其实保留）</div>
+      <img src="https://picsum.photos/seed/a4/1920/1080" alt="风景 4">
+      <img src="https://picsum.photos/seed/a5/800/800" alt="方图 5">
+    </div>
+    <div class="signature">——— 签名档 · 本行小图应被过滤 ———<br><img src="https://picsum.photos/seed/sig/240/60" alt="signature banner"></div>
+  </div>
+
+  <div id="injectPoint"></div>
+
+  <div class="card post">
+    <div class="post-head">
+      <span class="avatar" id="avatar2"></span>
+      <span class="nick">路过的网友</span>
+      <span class="floor">2 楼</span>
+    </div>
+    <div class="message">
+      <p>接楼上，我补几张。这里的图都用了懒加载属性 <code>data-src</code>。</p>
+      <img data-src="https://picsum.photos/seed/b1/1400/900" alt="懒加载 1">
+      <img data-src="https://picsum.photos/seed/b2/1200/1600" alt="懒加载 2">
+      <img data-src="https://picsum.photos/seed/b3/1024/768" alt="懒加载 3">
+    </div>
+  </div>
+
+  <div class="card post">
+    <div class="post-head">
+      <span class="avatar" id="avatar3"></span>
+      <span class="nick">图片党</span>
+      <span class="floor">3 楼</span>
+    </div>
+    <div class="message" id="bigMessage">
+      <p>我直接上 60 张，测试缩略图条在大量图片下的表现：</p>
+      <!-- 由脚本批量注入 -->
+    </div>
+  </div>
+
+  <div class="card post">
+    <div class="post-head">
+      <span class="avatar" id="avatar4"></span>
+      <span class="nick">长贴测试员</span>
+      <span class="floor">4 楼</span>
+    </div>
+    <div class="message">
+      <p><b>页面联动测试：</b>往下滚动浏览时，注意页面会自动跟随滚到当前图片位置。
+         按 <kbd>Esc</kbd> 退出后，页面应正好停在你刚看的那张图上。</p>
+      <img src="https://picsum.photos/seed/sync1/1500/900" alt="联动图 1">
+      <img src="https://picsum.photos/seed/sync2/900/1500" alt="联动图 2">
+      <img src="https://picsum.photos/seed/sync3/1400/800" alt="联动图 3">
+      <img src="https://picsum.photos/seed/sync4/1200/1600" alt="联动图 4">
+      <img src="https://picsum.photos/seed/sync5/1600/900" alt="联动图 5">
+      <img src="https://picsum.photos/seed/sync6/1000/1000" alt="联动图 6">
+    </div>
+  </div>
+
+  <div class="card post">
+    <div class="post-head">
+      <span class="nick">顺序测试员</span>
+      <span class="floor">5 楼</span>
+    </div>
+    <div class="message">
+      <p><b>顺序测试：</b>本楼的 img 在 DOM 中故意<b>倒序</b>书写（视觉上从上到下是 A→B→C，
+         但源码里 C 在最前）。浏览时应按<b>页面上看到的先后</b>（A、B、C）翻图，
+         而不是按源码 / 加载顺序。同时验证：退出后再次进入，应从上次那张继续。</p>
+      <img src="https://picsum.photos/seed/ordA/1200/800" alt="顺序 A（应在最前）">
+      <img src="https://picsum.photos/seed/ordB/1200/800" alt="顺序 B（应在中间）">
+      <img src="https://picsum.photos/seed/ordC/1200/800" alt="顺序 C（应在最后）">
+    </div>
+  </div>
+
+  <div class="card post" id="groupDemo">
+    <div class="post-head">
+      <span class="nick">分组测试员</span>
+      <span class="floor">6 楼</span>
+    </div>
+    <div class="message">
+      <p><b>以图定域测试：</b>把鼠标移到下面任一张图上，图片角落会浮出半透明的「看这组 · N」按钮——
+         点它只浏览该图所属的那一组（不是全页）。也可在浏览模式下按 <kbd>G</kbd> 切换本组/全部，
+         或第一下 <kbd>Esc</kbd> 退组、第二下关闭。</p>
+
+      <div class="gallery" id="gal-ant">
+        <p style="opacity:.6;font-size:12px;margin:6px 0 2px">图集 A · 手绘（3 张）</p>
+        <img src="https://picsum.photos/seed/ant1/900/600" alt="A-1 手绘">
+        <img src="https://picsum.photos/seed/ant2/900/600" alt="A-2 手绘">
+        <img src="https://picsum.photos/seed/ant3/900/600" alt="A-3 手绘">
+      </div>
+
+      <div class="gallery" id="gal-bee">
+        <p style="opacity:.6;font-size:12px;margin:14px 0 2px">图集 B · 实拍（2 张）</p>
+        <img src="https://picsum.photos/seed/bee1/900/600" alt="B-1 实拍">
+        <img src="https://picsum.photos/seed/bee2/900/600" alt="B-2 实拍">
+      </div>
+
+      <div class="gallery" id="gal-cat">
+        <p style="opacity:.6;font-size:12px;margin:14px 0 2px">图集 C · 扫描件（2 张）</p>
+        <img src="https://picsum.photos/seed/cat1/900/600" alt="C-1 扫描">
+        <img src="https://picsum.photos/seed/cat2/900/600" alt="C-2 扫描">
+      </div>
+
+      <p style="opacity:.5;font-size:12px;margin:14px 0 2px">下方为孤立单图（不成组，应回退全局）</p>
+      <img src="https://picsum.photos/seed/lone1/900/600" alt="孤立单图">
+    </div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <button id="btnInject">模拟 AJAX 追加 12 张图</button>
+  <button class="alt" id="btnInjectSmall">追加一批小图（应被过滤）</button>
+  <button class="alt" id="btnScrollTop">回到顶部</button>
+  <span class="tip">提示：图片 ≥ 5 张后，右下角出现「浏览图片」按钮 ｜ 浏览时页面会调暗并跟随滚动，按 Esc 退出后停回当前图</span>
+</div>
+
+<script>
+  // 头像（小尺寸，应被过滤）
+  (function seedAvatars(){
+    ['avatar1','avatar2','avatar3','avatar4'].forEach(function(id,i){
+      var el=document.getElementById(id); if(!el) return;
+      var im=document.createElement('img');
+      im.src='https://picsum.photos/seed/avatar'+i+'/80/80';
+      im.alt='avatar';
+      el.appendChild(im);
+    });
+    // 表情图
+    document.querySelectorAll('.smiley').forEach(function(im){
+      im.src='https://picsum.photos/seed/emo/20/20';
+    });
+  })();
+
+  // 3 楼：批量 60 张，混合尺寸
+  (function seed60(){
+    var host=document.getElementById('bigMessage'); if(!host) return;
+    var sizes=[[1600,900],[900,1600],[1200,1200],[1920,1200],[800,600],[1000,1500]];
+    for(var i=0;i<60;i++){
+      var s=sizes[i%sizes.length];
+      var im=document.createElement('img');
+      im.src='https://picsum.photos/seed/c'+i+'/'+s[0]+'/'+s[1];
+      im.alt='批量图 '+(i+1);
+      im.loading='lazy';   // 真实浏览器里会延迟加载
+      host.appendChild(im);
+    }
+  })();
+
+  // 懒加载属性还原（模拟论坛的 lazy-load 逻辑）
+  (function lazyRestore(){
+    var io=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(!en.isIntersecting) return;
+        var el=en.target;
+        if(el.dataset.src && !el.src){ el.src=el.dataset.src; }
+        io.unobserve(el);
+      });
+    },{rootMargin:'200px'});
+    document.querySelectorAll('img[data-src]').forEach(function(el){ io.observe(el); });
+  })();
+
+  // 模拟 AJAX 追加
+  document.getElementById('btnInject').addEventListener('click',function(){
+    var host=document.getElementById('injectPoint');
+    var s=[[1600,1000],[1100,1400],[1280,720]];
+    var frag=document.createDocumentFragment();
+    for(var i=0;i<12;i++){
+      var d=document.createElement('div'); d.className='card post';
+      d.innerHTML='<div class="post-head"><span class="nick">异步楼层</span><span class="floor">追加</span></div>'+
+        '<div class="message"><p>AJAX 动态插入的第 '+(i+1)+' 批：</p></div>';
+      var msg=d.querySelector('.message');
+      var sz=s[i%s.length];
+      var im=document.createElement('img');
+      im.src='https://picsum.photos/seed/ajax'+i+'/'+sz[0]+'/'+sz[1];
+      im.alt='AJAX 图 '+(i+1);
+      msg.appendChild(im);
+      frag.appendChild(d);
+    }
+    host.appendChild(frag);
+    window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
+  });
+
+  document.getElementById('btnInjectSmall').addEventListener('click',function(){
+    var host=document.getElementById('injectPoint');
+    var frag=document.createDocumentFragment();
+    for(var i=0;i<10;i++){
+      var im=document.createElement('img');
+      im.src='https://picsum.photos/seed/tiny'+i+'/60/60';
+      im.alt='tiny icon '+i;
+      frag.appendChild(im);
+    }
+    host.appendChild(frag);
+  });
+
+  document.getElementById('btnScrollTop').addEventListener('click',function(){
+    window.scrollTo({top:0,behavior:'smooth'});
+  });
+</script>
+</body>
+</html>
