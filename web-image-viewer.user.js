@@ -2,8 +2,8 @@
 // @name         网页图片浏览器
 // @name:en      Web Image Viewer
 // @namespace    local.web.imageviewer
-// @version      1.8.0
-// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，跨域自动降级，失败清单）。自动识别图片容器与分组边界（懒加载属性全量启发式识别，兼容各站私有命名），动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
+// @version      1.7.0
+// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，跨域自动降级，失败清单）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark
 // @match        *://*/*
 // @grant        GM_setValue
@@ -26,7 +26,7 @@
    * ========================================================================= */
 
   const NS = 'fiv';                     // 命名空间前缀
-  const VERSION = '1.8.0';              // 与头部 @version 保持一致
+  const VERSION = '1.7.0';              // 与头部 @version 保持一致
   const Z_BASE = 2147483000;            // 遮罩层级
   const LOG_PREFIX = '[图片浏览器]';
 
@@ -392,15 +392,7 @@
 
       const minW = Number(Config.get('minWidth')) || 0;
       const minH = Number(Config.get('minHeight')) || 0;
-      if (nw < minW || nh < minH) {
-        /* ⚠️ 「当前 src 是占位图」→ 不拒绝，改为 pending。
-           典型场景：站点先塞一张 1×1 / 极小灰图占位，滚动到视口时才换成真图。
-           此时 naturalWidth 有值但远小于阈值，若直接 reject 就永远错过真图了
-           —— 因为站点的替换动作不保证触发 load（有时是直接改属性，甚至同 src 重载）。
-           必须等属性变化（MutationObserver 已监听全量 data-*）或 load 后重判。 */
-        if (greyPlaceholderCandidate(el, src)) return 'pending';
-        return 'reject';
-      }
+      if (nw < minW || nh < minH) return 'reject';
       return 'ok';
     }
 
@@ -418,89 +410,23 @@
       return false;   // 走到这里说明是尺寸类拒绝 → 不缓存
     };
 
-    /**
-     * 「像不像图片地址」的启发式判定。
-     *
-     * 为什么需要启发式：社区懒加载属性名没有规范，data-tfsrc / data-original-src /
-     * data-raw / data-ks-lazyload / data-originalUrl… 几十种写法，靠枚举属性名必然漏。
-     * 与其补名单（补完又出新名字），不如判断「值长得像不像一个图片地址」。
-     */
-    function looksLikeImageUrl(s) {
-      if (!s) return false;
-      const v = String(s).trim();
-      if (!v || v.length > 2048) return false;          // 超长几乎必是 base64 data URI
-      if (/^data:/i.test(v)) return false;                // 占位用的 data URI，不是真图
-      if (/^(javascript|vbscript|file|blob|about):/i.test(v)) return false;
-      // 必须是可解析的相对/绝对地址
-      if (!/^(https?:)?\/\//i.test(v) && !/^(\.{0,2}\/|\/)/.test(v)) return false;
-      // 必须像图片：扩展名或 CDN 图片参数特征
-      if (/\.(jpe?g|png|gif|webp|avif|bmp|heic|tiff?)(\?|#|$)/i.test(v)) return true;
-      // 无扩展名时靠常见图床/CDN 参数特征兜底。两种写法都要认：
-      //   等号式  ?imageView&type=webp  /  ?w=1200&h=800  /  ?thumb
-      if (/\?(?:.*&)?(imageview2?|type|format|w|h|width|height|quality|thumb|resize)\s*=/i.test(v)) return true;
-      //   斜杠式（阿里云 OSS 风格）?imageView2/1/w/800  /  ?imageMogr2/thumbnail/800x
-      if (/\?(?:.*&)?(imageview2?|imagemogr2?|thumbnail)\/\d/i.test(v)) return true;
-      if (/\/(thumb|thumbnail|small|middle|big|large|origin|raw|original)\//i.test(v)) return true;
-      return false;
-    }
-
-    /**
-     * 已知的高优先级属性名（先按这些取，命中即用）。
-     * 顺序有意义：这些是各框架/ CMS 的约定名，可信度高于启发式扫描的结果。
-     */
-    const LAZY_ATTR_PRIORITY = [
-      'data-original', 'data-src', 'data-lazy-src', 'data-actualsrc',
-      'data-echo', 'data-url', 'data-image', 'data-large', 'data-origin'
-    ];
-
-    /**
-     * 取图片真实地址。
-     *
-     * 三层策略：
-     *   1. 已知高优先级 data-* 属性
-     *   2. **全量扫描其余 data-* 属性**（启发式判断值是否像图片地址）——
-     *      覆盖 data-tfsrc / data-original-src / data-raw 等几十种社区命名
-     *   3. srcset取最大的一张 → currentSrc / src
-     *
-     * ⚠️ 安全：所有分支返回前统一过 isSafeImageSrc()，拦掉 javascript: / file: 等脏协议。
-     */
+    /** 取图片真实地址（兼容懒加载属性与 srcset）
+     *  ⚠️ 安全：返回前统一过 isSafeImageSrc()，拦掉 javascript:/file: 等脏协议 */
     function pickSrc(el) {
       const ok = (v) => {
         if (!v) return false;
         const s = String(v).trim();
         if (!s) return false;
-        if (s.startsWith('data:image/gif')) return false;   // 常见的追踪像素
+        if (s.startsWith('data:image/gif')) return false;
         return isSafeImageSrc(s);
       };
-
-      // —— 第 1 层：已知高优先级属性 ——
-      for (const a of LAZY_ATTR_PRIORITY) {
+      const attrs = ['data-original', 'data-src', 'data-lazy-src', 'data-actualsrc',
+        'data-echo', 'data-url', 'data-image', 'data-large', 'data-origin'];
+      for (const a of attrs) {
         const v = el.getAttribute && el.getAttribute(a);
         if (ok(v)) return String(v).trim();
       }
-
-      // —— 第 2 层：全量扫描 data-* ——
-      // ⚠️ 必须**跳过已在上层查过的**，否则低优先级属性会抢在 srcset 之前被选中。
-      const seen = new Set(LAZY_ATTR_PRIORITY);
-      const attrs = el.attributes;
-      if (attrs && attrs.length) {
-        for (let i = 0; i < attrs.length; i++) {
-          const name = attrs[i].name;
-          if (!name || name.slice(0, 5) !== 'data-') continue;
-          const low = name.toLowerCase();
-          if (seen.has(low) || seen.has(name)) continue;
-          seen.add(low);
-          const v = attrs[i].value;
-          if (!ok(v)) continue;
-          if (!looksLikeImageUrl(v)) continue;
-          // 占位图特征文件名直接跳过（loading.gif / placeholder.png / spacer.svg）
-          if (greyPlaceholderCandidate(el, String(v).trim())) continue;
-          // 值里带占位词（data-src="loading/real.jpg"）不排除 —— 后缀匹配已足够保守
-          return String(v).trim();
-        }
-      }
-
-      // —— 第 3 层：srcset / picture / currentSrc ——
+      // srcset 取最大的一张
       const ss = el.getAttribute && el.getAttribute('srcset');
       if (ss) {
         const best = ss.split(',').map((s) => s.trim().split(/\s+/))
@@ -519,18 +445,7 @@
       const verdict = judge(el, src);
       if (verdict !== 'ok') {
         if (verdict === 'pending') {
-          /* 占位图等待真图：**不挂任何观察器**。
-             ⚠️ 曾试过给每个元素挂 MutationObserver，思路是「属性一变就重判」，
-             但这是错的：几百张图就是几百个 observer 实例，滚动时批量换 src
-             会同时触发几百个回调，实测明显掉帧。而且下面的 load 监听已经覆盖了
-             「图片真的换了地址并加载完成」这一主路径。
-             现在依赖三条既有通道，无需额外开销：
-               1. load 事件——站点改 src 后浏览器加载真图，会触发
-               2. 全局 MutationObserver —— 已把 data-* 高频命名纳入 attributeFilter，
-                  属性变化时置 needFull；虽然全量扫描低频，但配合下一条兜底
-               3. 15s 兜底全量扫描 —— 保证最坏情况下也会收敛
-             （代价：从占位图切到真图最多有 15s 延迟，这是可接受的取舍；
-               想要立即生效可菜单「↻ 重新扫描页面图片」。） */
+          // 挂载 load 事件，加载完成后重新判定
           if (!el.__fivHooked) {
             el.__fivHooked = true;
             const onLoad = () => {
@@ -541,8 +456,6 @@
             el.addEventListener('load', onLoad, { once: true });
             el.addEventListener('error', () => { el.__fivFailed = true; }, { once: true });
           }
-          // 记下当前占位地址，便于排障与后续逻辑判断
-          if (!el.__fivPendingSrc) el.__fivPendingSrc = src;
         } else if (verdict === 'reject' && judge.isPermanent(el, src)) {
           /* ⚠️ 只有「确定性」的拒绝才写入 rejected（头像/表情区、排除区、
              文本黑名单、非图片协议）——这些不会因为图片后续加载而改变。
@@ -574,12 +487,7 @@
 
       const item = { src, key, name, w, h, el, isBg: !!el.__fivBg };
       items.push(item);
-      if (el) {
-        byEl.set(el, item);
-        // 已定案：停掉该元素上pending 期的属性观察，避免无谓的重判回调
-        el.__fivDone = true;
-        if (el.__fivPendingSrc) el.__fivPendingSrc = src;
-      }
+      if (el) byEl.set(el, item);
       keySet.add(key);
       emitChange();
       return true;
@@ -895,29 +803,12 @@
     function markFullScanNeeded() { fullScanNeeded = true; }
 
     function startObserve() {
-      // 预先拼好选择器字符串：MutationObserver 回调里每条记录都会用到，
-      // 放循环外避免反复 join 造成的无谓开销
-      const CONTENT_SEL = AUTO_CONTENT_SELECTORS.join(',');
       try {
         const mo = new MutationObserver((records) => {
           const added = [];
           let needFull = false;
           for (const rec of records) {
-            if (rec.type === 'attributes') {
-              /* ⚠️ 属性变化（如懒加载站点把 data-tfsrc 从占位图换成真图）
-                 必须**立即**重判，不能只置 needFull 等 15s 兜底 ——
-                 否则用户滚到那儿要等十几秒才看到图出现。
-                 做法：把该元素的**最近内容容器**（而非元素本身）送进增量扫描。
-                 为什么不是直接送元素：scanNodes 的准入判定
-                 isWithinCollectScope() 是按「顶层节点」判的，
-                 单独一个 <img> 往往不匹配任何内容选择器 → 整批被拒。
-                 而它所在的 .message / .post 容器才是判定的正确粒度。 */
-              const el = rec.target;
-              if (el && el.nodeType === 1 && !el.__fivDone) {
-                added.push(el.closest && el.closest(CONTENT_SEL) || el);
-              }
-              continue;
-            }
+            if (rec.type === 'attributes') { needFull = true; continue; }
             /* 节点被移除 → 池内可能残留已不在 DOM 里的条目。
                不立刻全量重扫（代价高），标记为「需要一次全量」，
                由低频兜底扫描统一处理。 */
@@ -936,22 +827,7 @@
              缩放布局），一旦把 style 纳入监听，就形成
              「mousemove → 改 style → Observer 触发 → 全页 scanNow()」的
              自触发死循环，图片多的页面会明显吃 CPU。 */
-          attributes: true,
-          /* ⚠️ 监听哪些属性变化要跟 pickSrc 的采集面一致。
-             pickSrc 已改为全量扫描 data-*（启发式），但若这里只监听 4 个名字，
-             就会出现「扫描能看到、变化却收不到通知」的不对称 ——
-             data-tfsrc 从无到有时我们完全不知情，等到 15s 兜底扫描才补上。
-             ⚠️ 不能去掉 attributeFilter 改成监听全部属性：那会让站点给元素挂的
-             任何属性（data-state / aria-* / 悬停态标记）都触发回调，
-             图片多的页面会明显吃 CPU。这里按需列举已知高频命名，
-             其余靠 15s 兜底扫描兜住。 */
-          attributeFilter: [
-            'src', 'srcset', 'data-src', 'data-original', 'data-lazy-src',
-            'data-actualsrc', 'data-echo', 'data-url', 'data-image',
-            'data-large', 'data-origin', 'data-tfsrc', 'data-original-src',
-            'data-raw', 'data-ks-lazyload', 'data-originalurl', 'data-img',
-            'data-imageurl', 'data-srcset', 'data-lazy'
-          ]
+          attributes: true, attributeFilter: ['src', 'data-src', 'data-original', 'srcset']
         });
         observers.push(mo);
       } catch (e) { warn('MutationObserver 启动失败', e); }

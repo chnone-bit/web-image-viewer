@@ -107,14 +107,7 @@ setTimeout(() => {
 function sections234() {
   console.log('\n【2. Observer 不再监听 style】');
   ok('源码注释已说明不监听 style', CODE.indexOf("不要监听 'style'") >= 0);
-  /* ⚠️ 这里必须**解析** attributeFilter 的内容，不能整段字面匹配。
-     v1.8.0 把它从一行展开成多行（与 pickSrc 的采集面对齐，共 20 个名字），
-     字面匹配整段字符串就会假失败 —— 断言的是「filter 里没有 style」，
-     不是「filter 长什么样」。 */
-  const filters = (CODE.match(/attributeFilter:\s*\[([^\]]+)\]/g) || []).join(',');
-  ok('attributeFilter 已声明', filters.length > 0, '未找到 attributeFilter');
-  ok('attributeFilter 不含 style', !/'style'/.test(filters),
-    filters.slice(0, 120));
+  ok('attributeFilter 不含 style', CODE.indexOf("attributeFilter: ['src', 'data-src', 'data-original', 'srcset']") >= 0);
 
   console.log('\n【3. rejected 语义】');
   ok('存在 judge.isPermanent 判定', /judge\.isPermanent = function/.test(CODE));
