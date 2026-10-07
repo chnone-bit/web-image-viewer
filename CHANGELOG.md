@@ -25,11 +25,11 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **1.7.0** |
+| 当前版本 | **1.8.0** |
 | 脚本文件 | `web-image-viewer.user.js` |
-| 文件行数 | ~4720 |
+| 文件行数 | ~4840 |
 | 匹配范围 | `*://*/*`（全站可用，含白名单模式） |
-| 测试套件 | 12 个，合计 **366 项断言全绿** |
+| 测试套件 | 13 个，合计 **446 项断言全绿** |
 | 定位 | 通用网页图片组浏览 + 批量打包下载；论坛场景为最优适配对象 |
 | 计划中 | 跨域降级（`GM_xmlhttpRequest`）、超阈值分卷 ZIP |
 
@@ -54,7 +54,95 @@
 
 ## 版本历史
 
-### v1.7.0 — 跨域取图（GM_xmlhttpRequest 降级通道）（当前版本）
+### v1.8.0 — 懒加载图片地址采集（解法 1：全量启发式扫描）（当前版本）
+
+> **触发**：用户反馈「有一类网站自带看图功能，用了本脚本后只能拿到站点预设的占位图」。
+> 定位为**采集层缺口**，与 v1.7.0 的跨域权限无关 —— 采集面对的不是权限问题，
+> 而是"枚举属性名"这个做法本身不可扩展。
+
+#### 根因：白名单枚举必然漏
+
+原`pickSrc()` 只查 9 个固定属性名：
+
+```js
+const attrs = ['data-original', 'data-src', 'data-lazy-src', 'data-actualsrc',
+  'data-echo', 'data-url', 'data-image', 'data-large', 'data-origin'];
+```
+
+但社区懒加载**没有规范**。实测存在的命名至少还包括：
+`data-tfsrc`（ThinkPHP）、`data-original-src`（layui/lazyload）、`data-raw`、
+`data-ks-lazyload`（KSLazy）、`data-originalUrl`、`data-img`、`data-imageurl`、
+`data-srcset`、`data-lazy`… **补完名单还会出新名字**，属于打地鼠。
+
+#### 变更一：白名单 → 全量 `data-*` 启发式扫描
+
+新增 `looksLikeImageUrl(v)`，判定"这个属性的值长得像不像图片地址"：
+
+| 判据 | 例子 |
+|---|---|
+| 有图片扩展名 | `a.jpg` / `a.webp?v=2` / `a.PNG#x` |
+| 等号式CDN 参数 | `?imageView&type=webp`、`?w=1200&h=800` |
+| **斜杠式** CDN 参数 | `?imageView2/1/w/800`（阿里云 OSS）、`?imageMogr2/thumbnail/800x` |
+| 尺寸词路径 | `/thumb/` `/large/` `/resize/` `/original/` |
+| 前置排除 | `data:` URI、脏协议、超长串（base64） |
+
+三层优先级**必须严格保持**（有测试锁定）：
+
+```
+1. 已知高可信属性名（LAZY_ATTR_PRIORITY）
+2. 全量扫描其余 data-*（启发式）← 本次新增
+3. srcset（取最大档） → currentSrc / src
+```
+
+⚠️ 第 2 层会跳过已在第 1 层查过的属性，否则低可信属性会抢在 `srcset` 之前被选中。
+
+#### 变更二：占位图**不定案**（pending）
+
+原 `judge()` 只在 `naturalWidth === 0` 时返回 `pending`。但占位图场景是
+**naturalWidth 有值（1×1 已加载完）却远小于阈值**，直接被 `reject` 掉，
+真图来了也没机会补上。
+
+现在：尺寸过小**且**当前 src 命中占位图特征 → 返回 `pending` 而非 `reject`。
+
+#### 变更三：属性变化**立即**重判（而非等 15s）
+
+原 MutationObserver 对 `rec.type === 'attributes'` 只有一句 `needFull = true`，
+真正重判要等 15s 兜底扫描 —— 用户滚到那儿得等十几秒才看到图。
+
+现在改为把**该元素最近的内容容器**送进增量扫描：
+
+```js
+added.push(el.closest(CONTENT_SEL) || el);
+```
+
+⚠️ 为什么不是直接推元素本身：`scanNodes` 的准入判定 `isWithinCollectScope()`
+是按「顶层节点」粒度判的，单个 `<img>` 通常不匹配任何内容选择器 → 整批被拒。
+`.message` / `.post` 容器才是正确粒度。
+
+同时把 `attributeFilter` 从 4 个名字扩到 20 个，与 `pickSrc` 的采集面保持一致
+——**扫描能看到但变化收不到通知**是最隐蔽的不对称 bug。
+
+#### 两个被否决的设计（记录下来免得重犯）
+
+| 曾经的方案 | 为什么否决 |
+|---|---|
+| 给每个 pending 元素单独挂 MutationObserver | 几百张图 = 几百个 observer；滚动时批量换 src 同时触发几百个回调，实测掉帧 |
+| 去掉 `attributeFilter` 监听全部属性 | 站点挂的 `data-state` / `aria-*` / 悬停态标记都会触发回调，图片多的页面吃 CPU |
+
+最终方案复用**已有的**全局 observer，只改它的 attributes 分支，零新增实例。
+
+#### 测试
+
+新增 `verify-lazyload.js` **47 项**，全套 **13 套件 / 446 项全绿**。
+
+分组：奇葩属性名识别（9 种）/ CDN 参数兜底 / 占位图跳过（4 种）/
+非图片值不误判（7 种）/ **安全过滤不被绕过**（`javascript:` `file:` `vbscript:` `data:`）/
+优先级不被破坏 / 属性顺序无关 / 占位图→真图替换 / 定案后不重复入池 / 监听面覆盖。
+
+⚠️ 测试踩的坑：等待时间必须**大于** `scanAddedDebounced` 的 300ms 防抖，
+等于 300 会卡在边界上产生假失败（我第一次就栽在这）。
+
+### v1.7.0 — 跨域取图（GM_xmlhttpRequest 降级通道）
 
 > **触发事件**：v1.6.2 真机实测，批量下载全部失败。控制台报错
 > `Access to fetch at 'https://23img.com/...' from origin 'https://t66y.com'
@@ -1130,13 +1218,14 @@ ImageDownloader（独立模块，单向依赖 ImagePool.items）
 | `verify-settings.js` | 21 | 设置面板回显与交互 |
 | `verify-group.js` | 19 | 以图定域 / 分组浏览（v1.5 起断言组间续览） |
 | `verify-badge.js` | 15 | 悬停角标 |
-| `verify-hardening.js` | 21 | URL 安全、Observer、rejected、白名单 |
+| `verify-hardening.js` | 22 | URL 安全、Observer、rejected、白名单 |
 | `verify-group-v2.js` | 19 | **v1.3 分组收敛专项** |
 | `verify-batch4.js` | 29 | **v1.4 增量扫描 / 准入过滤 / 虚拟缩略图 / 死代码** |
 | `verify-batch5.js` | 34 | **v1.5 角标稳定性 / 缩略条拖动与点选（含 CSS 命中测试模拟） / 分组枚举 / 组间续览** |
 | `verify-download.js` | 121 | **v1.6 打包下载：ZIP 结构与 CRC 基准校验 / 文件名生成与清洗 / 失败清单 / 取消 / 池状态隔离 / UI 接线** |
 | `verify-strip.js` | 25 | **v1.6.1 缩略图条跟随：滚动进视野 / 虚拟窗口跟随 index / 序号与实际数量一致 / 关闭条边界** |
-| **合计** | **366** | **失败 0** |
+| `verify-lazyload.js` | 47 | **v1.8 懒加载采集：奇葩属性名识别 / CDN 参数兜底 / 占位图跳过 / 非图片值不误判 / 安全过滤不被绕过 / 优先级与属性顺序无关 / 占位图→真图属性替换** |
+| **合计** | **446** | **失败 0** |
 
 运行方式：
 
@@ -1186,4 +1275,4 @@ v1.5.0 曾尝试左侧树形目录作为组间跳转入口，因体验不佳于 
 
 ---
 
-*文档最后更新：对应脚本版本 1.7.0*
+*文档最后更新：对应脚本版本 1.8.0*
