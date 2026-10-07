@@ -2,8 +2,8 @@
 // @name         网页图片浏览器
 // @name:en      Web Image Viewer
 // @namespace    local.web.imageviewer
-// @version      1.6.2
-// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，失败清单）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
+// @version      1.7.0
+// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，跨域自动降级，失败清单）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark
 // @match        *://*/*
 // @grant        GM_setValue
@@ -11,6 +11,8 @@
 // @grant        GM_deleteValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      *
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -24,7 +26,7 @@
    * ========================================================================= */
 
   const NS = 'fiv';                     // 命名空间前缀
-  const VERSION = '1.6.2';              // 与头部 @version 保持一致
+  const VERSION = '1.7.0';              // 与头部 @version 保持一致
   const Z_BASE = 2147483000;            // 遮罩层级
   const LOG_PREFIX = '[图片浏览器]';
 
@@ -151,6 +153,10 @@
     hoverBadgeGroupOnly: true,  // 仅当该图所在组含 ≥2 张时才显示（单图不显示）
     // —— 分组浏览 ——
     groupChaining: true,        // 组内翻到边界时，自动续到相邻组（否则仅提示）
+    // —— 打包下载 ——
+    // fetch 被 CORS 拦截时，是否降级到 GM_xmlhttpRequest 绕过同源策略。
+    // 关闭后仅能下载同源/已开放 CORS 的图；开启会由扩展层发出跨域请求。
+    crossOriginFallback: true,
     // —— 观感 ——
     adaptTheme: true,           // 自适应论坛原生风格
     thumbnailBar: true,
@@ -1481,9 +1487,90 @@
 
     /* ---------------- 取 Blob ---------------- */
 
+    /** 跨域通道是否可用（油猴未提供 GM_xmlhttpRequest 时降级为纯 fetch）。 */
+    function hasGmXhr() {
+      // 用户可在设置里关闭跨域降级（隐私敏感站点）
+      return typeof GM_xmlhttpRequest === 'function'
+        && Config.get('crossOriginFallback') !== false;
+    }
+
+    /** 从 GM 返回的原始响应头字符串里取某个字段。 */
+    function headerOf(raw, name) {
+      if (!raw) return '';
+      const re = new RegExp('^\\s*' + name + '\\s*:\\s*(.+)$', 'im');
+      const m = String(raw).match(re);
+      return m ? m[1].trim() : '';
+    }
+
+    /**
+     * 跨域取图通道（GM_xmlhttpRequest）。
+     *
+     * 为什么需要它：论坛图床（23img / 66img / thumbsnap 等）几乎都不发
+     * `Access-Control-Allow-Origin`，浏览器的 `fetch` 会被同源策略拦掉
+     * ——<img> 能显示是因为图片加载本就不受同源策略约束，但 fetch 要读
+     * 二进制就必须过 CORS。GM_xmlhttpRequest 由扩展层发请求，不受此限。
+     *
+     * 用 arraybuffer 而非 blob：blob 在部分 GM 实现里类型不稳定，
+     * 而扩展名推断本来就依赖 Content-Type，从响应头取更可控。
+     */
+    function gmFetchOne(item, signal) {
+      return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) { reject(new Error('已取消')); return; }
+        let settled = false;
+        let req = null;
+        const finish = (fn, v) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          if (signal) signal.removeEventListener('abort', onAbort);
+          fn(v);
+        };
+        const onAbort = () => {
+          try { if (req) req.abort(); } catch (e) { /* 已完成 */ }
+          finish(reject, new Error('已取消'));
+        };
+        // GM 侧 ontimeout 在部分实现不触发，这里再加一道保险
+        const timer = setTimeout(() => {
+          try { if (req) req.abort(); } catch (e) { /* noop */ }
+          finish(reject, new Error('超时'));
+        }, TIMEOUT + 2000);
+
+        try {
+          req = GM_xmlhttpRequest({
+            method: 'GET',
+            url: item.src,
+            responseType: 'arraybuffer',
+            timeout: TIMEOUT,
+            anonymous: false,        // 携带 Cookie，登录态图床必需
+            onload(res) {
+              const st = res ? res.status : 0;
+              if (!res || st < 200 || st >= 300) { finish(reject, new Error('HTTP ' + (st || '?'))); return; }
+              const mime = headerOf(res.responseHeaders, 'content-type');
+              if (mime && !/^image\//i.test(mime) && !/octet-stream/i.test(mime)) {
+                finish(reject, new Error('非图片响应(' + mime.split(';')[0].trim() + ')'));
+                return;
+              }
+              if (!res.response) { finish(reject, new Error('响应为空')); return; }
+              finish(resolve, { bytes: new Uint8Array(res.response), mime });
+            },
+            onerror() { finish(reject, new Error('跨域请求失败')); },
+            ontimeout() { finish(reject, new Error('超时')); },
+            onabort() { finish(reject, new Error('已取消')); }
+          });
+        } catch (e) {
+          finish(reject, new Error('GM 通道异常: ' + ((e && e.message) || e)));
+          return;
+        }
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      });
+    }
+
     /**
      * 取单张图片的二进制。仅接受 http/https。
-     * @returns {Promise<{bytes:Uint8Array, mime:string}>}
+     *
+     * 策略：先走 fetch（同源/允许 CORS 的图更快，且能复用 HTTP 缓存），
+     * 失败后降级到 GM_xmlhttpRequest 绕过同源策略。
+     * @returns {Promise<{bytes:Uint8Array, mime:string, via:string}>}
      */
     async function fetchOne(item, signal) {
       if (!isSafeExternalUrl(item.src)) throw new Error('地址不受支持');
@@ -1507,7 +1594,14 @@
           throw new Error('非图片响应');
         }
         const buf = await resp.arrayBuffer();
-        return { bytes: new Uint8Array(buf), mime };
+        return { bytes: new Uint8Array(buf), mime, via: 'fetch' };
+      } catch (e) {
+        // 取消是用户意图，不降级重试
+        if (signal && signal.aborted) throw new Error('已取消');
+        if (!hasGmXhr()) throw e;
+        // 跨域请求由扩展层发出，不受同源策略约束
+        const r = await gmFetchOne(item, signal);
+        return { bytes: r.bytes, mime: r.mime, via: 'gm' };
       } finally {
         clearTimeout(timer);
         if (signal) signal.removeEventListener('abort', onAbort);
@@ -1546,7 +1640,7 @@
           const it = list[i];
           try {
             const r = await fetchOne(it, signal);
-            results[i] = { ok: true, item: it, bytes: r.bytes, mime: r.mime };
+            results[i] = { ok: true, item: it, bytes: r.bytes, mime: r.mime, via: r.via };
           } catch (e) {
             if (signal && signal.aborted) { cancelled = true; return; }
             results[i] = { ok: false, item: it, reason: (e && e.message) || String(e) };
@@ -1594,12 +1688,23 @@
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10000);
 
-      return { ok: files.length, failed, bytes: zipBytes.length, cancelled: false };
+      // 统计各通道命中数：便于诊断"哪些图走了跨域降级"
+      const viaCount = { fetch: 0, gm: 0 };
+      for (let i = 0; i < total; i++) {
+        const r = results[i];
+        if (r && r.ok && viaCount[r.via] !== undefined) viaCount[r.via]++;
+      }
+
+      return { ok: files.length, failed, bytes: zipBytes.length, cancelled: false, via: viaCount };
     }
 
     return {
       download,
+      hasGmXhr,
       /* 暴露纯函数便于测试 */
+      _fetchOne: fetchOne,
+      _gmFetchOne: gmFetchOne,
+      _headerOf: headerOf,
       _buildZip: buildZip,
       _crc32: crc32,
       _makeFilename: makeFilename,
@@ -3336,8 +3441,10 @@ kbd.${NS}-kbd {
         let hint = '';
         if (first) {
           const r = first.reason || '';
-          if (/Failed to fetch|NetworkError|load failed/i.test(r)) {
-            hint = '\n可能原因：图片跨域，浏览器不允许脚本读取（需要 GM_xmlhttpRequest 才能绕过）。';
+          if (!ImageDownloader.hasGmXhr()) {
+            hint = '\n可能原因：油猴未授予 GM_xmlhttpRequest 权限，跨域图无法绕过浏览器同源策略。';
+          } else if (/Failed to fetch|NetworkError|load failed|跨域请求失败/i.test(r)) {
+            hint = '\n可能原因：图床校验 Referer、要求登录 Cookie，或该图已被删除。';
           } else if (/^HTTP 4/.test(r)) {
             hint = '\n可能原因：图片需要登录态或已失效（404/403）。';
           } else if (/超时|abort/i.test(r)) {
@@ -3351,11 +3458,14 @@ kbd.${NS}-kbd {
       }
 
       const sizeMb = (res.bytes / 1048576).toFixed(1);
+      const viaNote = (res.via && res.via.gm)
+        ? '（' + res.via.fetch + ' 直连 + ' + res.via.gm + ' 跨域通道）'
+        : '';
       // ⚠️ 主文案必须同时报成功与失败数：只写「已打包 2 张」会让用户以为另外 2 张
       //    根本不存在，误以为功能有问题。失败明细在下方，但主文案要给出全貌。
       packShow(res.failed.length
-        ? '✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB（' + res.failed.length + ' 张失败，见下方）'
-        : '✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB', 1);
+        ? '✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB（' + res.failed.length + ' 张失败，见下方）' + viaNote
+        : '✅ 已打包 ' + res.ok + ' 张 · ' + sizeMb + ' MB' + viaNote, 1);
       if (res.failed.length) {
         packDetailSet(
           ['⚠️ 有 ' + res.failed.length + ' 张未能获取：']
@@ -4013,7 +4123,8 @@ kbd.${NS}-kbd {
       ['strictFilter', '严格过滤小图', '同时排除装饰性背景图'],
       ['dedupeByUrl', '按 URL 去重', '同一图片地址全页只浏览一次。关闭时按页面节点收录（推荐关闭，否则同图出现在两个帖子会让其中一个分组失败）'],
       ['whitelistOnly', '仅在白名单站点启用', '开启后，只有下方列表命中的站点才加载悬浮按钮与角标'],
-      ['groupChaining', '组间连续浏览', '分组内翻到第一张/最后一张时，自动续到相邻组。关闭则停留在组内并提示']
+      ['groupChaining', '组间连续浏览', '分组内翻到第一张/最后一张时，自动续到相邻组。关闭则停留在组内并提示'],
+      ['crossOriginFallback', '打包下载跨域降级', 'fetch 被 CORS 拦截时改由 GM_xmlhttpRequest 取图。关闭则仅能下载同源图片，但不会向图床发起扩展层请求']
     ];
 
     const NUMBERS = [
@@ -4124,6 +4235,15 @@ kbd.${NS}-kbd {
         '自动把页面图片按「一层楼 / 一个图集 / 一段配图」分组。在某张图上用悬停角标「看这组」即可只浏览该组，' +
         '按 <kbd class="' + NS + '-kbd">G</kbd> 可在「本组 / 全部」之间切换。</span></label></div>';
       html += toggleRow('groupChaining');
+      html += '</div>';
+
+      html += '<div class="' + NS + '-group"><h4>批量打包下载</h4>';
+      html += '<div class="' + NS + '-row ' + NS + '-row-col"><label>说明<span class="' + NS + '-hint">' +
+        '工具条 <kbd class="' + NS + '-kbd">📦</kbd> 按钮或 <kbd class="' + NS + '-kbd">Shift+D</kbd> 可把图片打包成 ZIP。' +
+        '图片浏览页几乎总是跨域的，浏览器不允许 fetch 读取内容，因此默认会改用 GM_xmlhttpRequest 绕过；' +
+        '若你在敏感站点上不希望脚本向图床发起请求，可关闭下方开关（代价是跨域图下不了）。' +
+        '</span></label></div>';
+      html += toggleRow('crossOriginFallback');
       html += '</div>';
 
       html += '<div class="' + NS + '-group"><h4>图片悬停角标</h4>';
@@ -4478,37 +4598,41 @@ kbd.${NS}-kbd {
      * 有了它，「点了没反应」就能立刻定位到具体是哪一张、什么原因。
      */
     window.__fiv.diagPack = async function (mode) {
-      const list = (mode === 'group' && Viewer.inGroup)
+      const items = (mode === 'group' && Viewer.inGroup)
         ? null   // 分组快照在 Viewer 内部，这里用全部即可，诊断目的相同
         : ImagePool.items.slice();
-      const items = list || ImagePool.items.slice();
-      const group = LOG_PREFIX + ' [打包诊断] 共 ' + items.length + ' 张';
+      const list = items || ImagePool.items.slice();
+      const group = LOG_PREFIX + ' [打包诊断] 共 ' + list.length + ' 张';
       console.log(group);
-      if (!items.length) { console.warn(group, '图片池为空'); return; }
+      console.log('[打包诊断] GM_xmlhttpRequest 跨域通道：' + (ImageDownloader.hasGmXhr() ? '可用' : '不可用（权限未授予）'));
+      if (!list.length) { console.warn(group, '图片池为空'); return; }
       const rows = [];
-      for (let i = 0; i < items.length; i++) {
-        const it = items[i];
+      for (let i = 0; i < list.length; i++) {
+        const it = list[i];
         const line = { i: i + 1, src: it.src };
         try {
-          const resp = await fetch(it.src, { credentials: 'include', referrerPolicy: 'no-referrer', cache: 'force-cache' });
-          line.status = resp.status;
-          line.ok = resp.ok;
-          line.mime = resp.headers.get('content-type');
-          const buf = await resp.arrayBuffer();
-          line.bytes = buf.byteLength;
-          console.log('✅', line.i, line.status, line.mime, line.bytes + 'B', it.src);
+          // 走真实取数链路（含 GM 降级），而不是裸 fetch ——
+          // 裸 fetch 只会重现 CORS 报错，无法验证降级通道是否真的work。
+          const r = await ImageDownloader._fetchOne(it, null);
+          line.ok = true;
+          line.via = r.via;
+          line.mime = r.mime;
+          line.bytes = r.bytes.length;
+          console.log('✅', line.i, '[' + r.via + ']', line.mime, line.bytes + 'B', it.src);
         } catch (e) {
+          line.ok = false;
           line.error = (e && e.message) || String(e);
           console.warn('❌', line.i, line.error, it.src);
         }
         rows.push(line);
       }
       const bad = rows.filter((r) => !r.ok);
-      console.log('%c[打包诊断] 完成：成功 %d / 失败 %d',
-        'color:' + (bad.length ? '#c00' : '#0a0'), rows.length - bad.length, bad.length);
+      const byGm = rows.filter((r) => r.via === 'gm').length;
+      console.log('%c[打包诊断] 完成：成功 %d / 失败 %d（其中 %d 张走了跨域降级通道）',
+        'color:' + (bad.length ? '#c00' : '#0a0'), rows.length - bad.length, bad.length, byGm);
       if (bad.length) {
-        console.warn('[打包诊断] 失败多半是跨域被 CORS 拦住。'
-          + '浏览器允许 <img> 跨域显示，但不允许 fetch 读取内容。');
+        console.warn('[打包诊断] 仍有失败。若通道显示"可用"却依旧失败，'
+          + '通常是图床需要 Referer 校验、需要登录 Cookie，或该图已被删除。');
       }
       return rows;
     };

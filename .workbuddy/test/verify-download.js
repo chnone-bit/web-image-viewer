@@ -75,6 +75,13 @@ const THREE_GROUPS = '<div class="thread">'
   + '</div></div>'
   + '</div>';
 
+/* ---- GM_xmlhttpRequest 桩 ----
+ * 模拟油猴跨域通道。默认不启用（NEXT_GM 为 null 时不定义该函数），
+ * 这样「无 GM 环境」与「有 GM 环境」两种降级路径都能测。
+ * 用模块级变量是因为 withPage 内部就 new JSDOM，外部无法提前注入。 */
+let NEXT_GM = null;
+function setGmImpl(fn) { NEXT_GM = fn; }
+
 function withPage(html) {
   const dom = new JSDOM('<!DOCTYPE html><html><body>' + html + '</body></html>',
     { url: 'https://forum.example.com/t.html', runScripts: 'outside-only', pretendToBeVisual: true });
@@ -110,6 +117,22 @@ function withPage(html) {
     status: 200, headers: { 'content-type': 'image/jpeg' }
   });
   w.fetch = function (url) { return w.__fetchImpl(url); };
+
+  /* ---- GM_xmlhttpRequest 桩 ----
+   * 默认不存在（NEXT_GM 为 null 时不定义该函数），
+   * 这样「无 GM 环境」与「有 GM 环境」两种降级路径都能测。 */
+  w.__gmCalls = [];
+  if (NEXT_GM) {
+    w.GM_xmlhttpRequest = function (opt) {
+      w.__gmCalls.push({ url: opt.url, method: opt.method, responseType: opt.responseType, anonymous: opt.anonymous });
+      const req = { aborted: false, abort() { this.aborted = true; } };
+      setTimeout(() => {
+        if (req.aborted) { if (opt.onabort) opt.onabort(); return; }
+        NEXT_GM(opt, req);
+      }, 0);
+      return req;
+    };
+  }
   // 记录 <a download> 触发
   w.__downloads = [];
   const origClick = w.HTMLAnchorElement.prototype.click;
@@ -488,17 +511,172 @@ const enc = (s) => new TextEncoder().encode(s);
     try { rows = await w.__fiv.diagPack('all'); } catch (e) { err = e; }
     ok('diagPack 可执行不抛异常', !err, err ? err.message : '');
     ok('逐张返回诊断结果', Array.isArray(rows) && rows.length === 4, 'rows=' + (rows ? rows.length : 'null'));
-    ok('结果含 status/ok 字段', !!(rows && rows[0] && 'status' in rows[0] && 'ok' in rows[0]),
+    ok('结果含 ok 字段', !!(rows && rows[0] && 'ok' in rows[0]),
+      rows && rows[0] ? JSON.stringify(rows[0]) : '');
+    // v1.7.0 起 diagPack 走真实取数链路（含 GM 降级），
+    // 因此成功项的标识从 HTTP status 变为通道名 via。
+    ok('结果含 via（fetch / gm）字段', !!(rows && rows[0] && 'via' in rows[0]),
       rows && rows[0] ? JSON.stringify(rows[0]) : '');
   }
 
-  console.log('\n【安全边界】模块不引入新的 @grant');
+  console.log('\n【跨域降级】fetch 被 CORS 拦下时改走 GM 通道（用户真机反馈的核心问题）');
+  {
+    // 场景还原：论坛图床 23img / thumbsnap 等不返回 Access-Control-Allow-Origin，
+    // 浏览器 fetch 直接 TypeError: Failed to fetch。
+    setGmImpl((opt) => {
+      opt.onload({
+        status: 200,
+        responseHeaders: 'content-type: image/jpeg\r\ncontent-length: 4\r\n',
+        response: new Uint8Array([9, 9, 9, 9]).buffer
+      });
+    });
+    const { w, V } = await withPage(THREE_GROUPS);
+    w.__fetchImpl = async () => { throw new TypeError('Failed to fetch'); };
+    ok('GM 通道被识别为可用', w.__fiv.ImageDownloader.hasGmXhr() === true);
+
+    V.openAt(0);
+    await sleep(100);
+    V.packDownload('all');
+    await sleep(500);
+
+    ok('跨域请求确实发到了 GM 通道', w.__gmCalls.length > 0, 'calls=' + w.__gmCalls.length);
+    ok('使用了 arraybuffer 响应类型', w.__gmCalls.every((c) => c.responseType === 'arraybuffer'),
+      JSON.stringify(w.__gmCalls[0] || {}));
+    ok('携带 Cookie（登录态图床必需）', w.__gmCalls.every((c) => c.anonymous === false),
+      JSON.stringify(w.__gmCalls[0] || {}));
+    ok('CORS 拦截下仍成功打包', w.__downloads.length === 1, 'downloads=' + w.__downloads.length);
+    ok('产出的是 ZIP', w.__downloads.length > 0 && /\.zip$/.test(w.__downloads[0].name),
+      w.__downloads.length ? w.__downloads[0].name : '无');
+
+    const panel = w.document.querySelector('.fiv-pack');
+    const txt = panel ? panel.querySelector('.fiv-pack-txt').textContent : '';
+    ok('全部成功无失败提示', /已打包\s*4\s*张/.test(txt), txt);
+    ok('主文案标明走了跨域通道', /跨域通道/.test(txt), txt);
+  }
+
+  console.log('\n【跨域降级】无 GM 权限 / 用户关闭开关时不得发起扩展层请求');
+  {
+    setGmImpl(null);   // 模拟油猴未授予权限
+    const { w, V } = await withPage(THREE_GROUPS);
+    w.__fetchImpl = async () => { throw new TypeError('Failed to fetch'); };
+    ok('无 GM 时 hasGmXhr 为 false', w.__fiv.ImageDownloader.hasGmXhr() === false);
+
+    V.openAt(0);
+    await sleep(100);
+    V.packDownload('all');
+    await sleep(400);
+    ok('未产出 ZIP（符合预期，无可用通道）', w.__downloads.length === 0);
+    const panel = w.document.querySelector('.fiv-pack');
+    const txt = panel ? panel.querySelector('.fiv-pack-txt').textContent : '';
+    ok('提示指向权限缺失而非泛泛说跨域', /权限/.test(txt), txt);
+  }
+  {
+    // 用户主动关闭降级开关：即使有 GM 权限也不得使用
+    setGmImpl((opt) => opt.onload({
+      status: 200, responseHeaders: 'content-type: image/jpeg', response: new Uint8Array([1]).buffer
+    }));
+    const { w, V, C } = await withPage(THREE_GROUPS);
+    C.set('crossOriginFallback', false);
+    w.__fetchImpl = async () => { throw new TypeError('Failed to fetch'); };
+    ok('开关关闭后 hasGmXhr 为 false', w.__fiv.ImageDownloader.hasGmXhr() === false,
+      '开关未生效');
+
+    V.openAt(0);
+    await sleep(100);
+    V.packDownload('all');
+    await sleep(400);
+    ok('开关关闭时零扩展层请求', w.__gmCalls.length === 0, 'calls=' + w.__gmCalls.length);
+    ok('开关关闭时不产出 ZIP', w.__downloads.length === 0);
+  }
+  setGmImpl(null);
+
+  console.log('\n【跨域降级】同源可用时不走 GM（避免无谓的权限使用）');
+  {
+    setGmImpl((opt) => opt.onload({
+      status: 200, responseHeaders: 'content-type: image/jpeg', response: new Uint8Array([1]).buffer
+    }));
+    const { w, V } = await withPage(THREE_GROUPS);
+    // fetch 正常返回，不该触发降级
+    w.__fetchImpl = async () => new globalThis.Response(new Uint8Array([1, 2]), {
+      status: 200, headers: { 'content-type': 'image/jpeg' }
+    });
+    V.openAt(0);
+    await sleep(100);
+    V.packDownload('all');
+    await sleep(400);
+    ok('同源成功时零 GM 请求', w.__gmCalls.length === 0, 'calls=' + w.__gmCalls.length);
+    ok('同源成功时正常产出 ZIP', w.__downloads.length === 1);
+    const panel = w.document.querySelector('.fiv-pack');
+    const txt = panel ? panel.querySelector('.fiv-pack-txt').textContent : '';
+    ok('主文案不误报跨域通道', !/跨域通道/.test(txt), txt);
+  }
+  setGmImpl(null);
+
+  console.log('\n【跨域降级】GM 侧的各类失败必须如实上报，不得静默');
+  {
+    const cases = [
+      ['HTTP 404', (opt) => opt.onload({ status: 404, responseHeaders: '', response: new ArrayBuffer(0) }), /HTTP 404/],
+      ['非图片响应', (opt) => opt.onload({ status: 200, responseHeaders: 'content-type: text/html', response: new ArrayBuffer(2) }), /非图片响应/],
+      ['网络错误', (opt) => opt.onerror(), /跨域请求失败/],
+      ['超时', (opt) => opt.ontimeout(), /超时/],
+      ['响应为空', (opt) => opt.onload({ status: 200, responseHeaders: 'content-type: image/jpeg', response: null }), /响应为空/]
+    ];
+    for (const [name, impl, re] of cases) {
+      setGmImpl(impl);
+      const { w, V } = await withPage(THREE_GROUPS);
+      w.__fetchImpl = async () => { throw new TypeError('Failed to fetch'); };
+      V.openAt(0);
+      await sleep(80);
+      V.packDownload('all');
+      await sleep(350);
+      const panel = w.document.querySelector('.fiv-pack');
+      const detail = panel ? panel.querySelector('.fiv-pack-detail').textContent : '';
+      ok('GM ' + name + ' 被如实上报', re.test(detail), detail.slice(0, 90));
+      ok('GM ' + name + ' 时不产出 ZIP', w.__downloads.length === 0);
+    }
+  }
+  setGmImpl(null);
+
+  console.log('\n【跨域降级】取消必须能中断正在飞的 GM 请求');
+  {
+    setGmImpl((opt) => {
+      // 永不回调，模拟慢响应
+      void opt;
+    });
+    const { w, V } = await withPage(THREE_GROUPS);
+    w.__fetchImpl = async () => { throw new TypeError('Failed to fetch'); };
+    V.openAt(0);
+    await sleep(100);
+    V.packDownload('all');
+    await sleep(150);
+    const cancel = w.document.querySelector('.fiv-pack button');
+    ok('进度面板提供取消按钮', !!cancel);
+    if (cancel) cancel.click();
+    await sleep(400);
+    ok('取消后不产出 ZIP', w.__downloads.length === 0, 'downloads=' + w.__downloads.length);
+  }
+  setGmImpl(null);
+
+  console.log('\n【安全边界】跨域权限有明确边界且可由用户关闭');
   {
     const head = CODE.slice(0, CODE.indexOf('==/UserScript=='));
     const grants = (head.match(/@grant\s+(\S+)/g) || []).map((s) => s.replace('@grant', '').trim());
-    ok('未新增 GM_xmlhttpRequest', !grants.includes('GM_xmlhttpRequest'), grants.join(','));
-    ok('未新增 @connect', !/@connect/.test(head));
-    ok('grant 数量仍为 5', grants.length === 5, 'grants=' + grants.length + ' → ' + grants.join(','));
+    // v1.7.0 起：用户实测确认论坛图床（23img/66img/thumbsnap）全部拦 CORS，
+    // 纯 fetch 方案不可用，经用户决策加入 GM_xmlhttpRequest。
+    // 此处断言随之从「禁止新增」改为「新增的权限必须被显式记录 + 必须可关闭」。
+    ok('已授予 GM_xmlhttpRequest（跨域取图必需）', grants.includes('GM_xmlhttpRequest'), grants.join(','));
+    ok('grant 数量为 6（原 5 + GM_xmlhttpRequest）', grants.length === 6, 'grants=' + grants.length + ' → ' + grants.join(','));
+    ok('存在 @connect 声明', /@connect\s+\S/.test(head),
+      (head.match(/@connect[^\n]*/) || ['无'])[0]);
+    ok('@connect 之后没有其它新 grant 混入', grants.filter((g) => !/^(GM_setValue|GM_getValue|GM_deleteValue|GM_addStyle|GM_registerMenuCommand|GM_xmlhttpRequest)$/.test(g)).length === 0,
+      grants.join(','));
+
+    // 安全阀：用户必须能关掉跨域降级，否则「扩展层向任意站点发请求」无法收敛
+    ok('提供 crossOriginFallback 开关', /crossOriginFallback/.test(CODE));
+    ok('开关默认开启', /crossOriginFallback:\s*true/.test(CODE));
+    ok('hasGmXhr 读取该开关', /hasGmXhr[\s\S]{0,400}crossOriginFallback/.test(CODE),
+      'hasGmXhr 未受开关控制');
+    ok('开关出现在设置面板中', /toggleRow\('crossOriginFallback'\)/.test(CODE));
   }
 
   console.log('\n' + '═'.repeat(31));
