@@ -29,6 +29,14 @@ for (const f of FILES) {
   else {
     m = out.match(/(\d+)\s*passed[^\d]*(\d+)\s*failed/i);
     if (m) { p = +m[1]; fl = +m[2]; }
+    else {
+      /* 真机套件（verify-lazy-live.js）走断言制，输出「PASS name / FAIL name」。
+         ⚠️ 用 ASCII 而非 emoji —— emoji 经管道重定向会被按控制台代码页
+            编码破坏，导致统计解析不到。 */
+      const passed = (out.match(/^\s*PASS\s/gm) || []).length;
+      const failed = (out.match(/^\s*FAIL\s/gm) || []).length;
+      if (passed + failed > 0) { p = passed; fl = failed; }
+    }
   }
   if (p === null) {
     console.log(f.padEnd(24) + ' (无法解析统计)');

@@ -298,10 +298,16 @@ async function connect() {
   };
   console.log('\n断言：');
   for (const [k, v] of Object.entries(asserts)) {
-    console.log('  ' + (v ? '✅' : '❌') + ' ' + k);
+    /* 用 ASCII 标记（PASS/FAIL）而非 emoji —— emoji 经管道/重定向会被
+       按控制台代码页编码破坏，导致统计解析不到。 */
+    console.log('  ' + (v ? 'PASS' : 'FAIL') + ' ' + k);
   }
   const allPass = Object.values(asserts).every(Boolean);
-  console.log('\n' + (allPass ? '🎉 全部断言通过' : '⚠️ 有断言未通过'));
+  const nPass = Object.values(asserts).filter(Boolean).length;
+  console.log('\n' + (allPass ? '全部断言通过' : '有断言未通过'));
+  console.log('\n' + '='.repeat(52));
+  console.log('  通过 ' + nPass + ' 项 · 失败 ' + (asserts.length - nPass) + ' 项');
+  console.log('='.repeat(52));
   process.exit(allPass ? 0 : 1);
 })().catch(e => { console.error('失败:', e.message); process.exit(1); });
 
