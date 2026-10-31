@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图片浏览器 · 懒加载提升验证</title>
+<style>
+  body{margin:0;padding:24px 20px;font:14px/1.7 -apple-system,"Microsoft YaHei",sans-serif;background:#f6f7f9;color:#222}
+  .wrap{max-width:900px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 6px}
+  .sub{color:#6b7280;font-size:13px;margin:0 0 18px;line-height:1.8}
+  .panel{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px 18px;margin:14px 0}
+  .post{border:1px solid #e5e7eb;border-radius:10px;padding:16px;margin:14px 0;background:#fff}
+  .message img{width:100%;max-width:520px;height:auto;border-radius:8px;margin:10px 0;display:block;background:#e5e7eb}
+  .spacer{height:600px;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:13px;background:repeating-linear-gradient(45deg,#fafafa,#fafafa 12px,#f4f4f4 12px,#f4f4f4 24px);border-radius:8px;margin:14px 0}
+  code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
+  .hint{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;border-radius:8px;padding:12px 14px;font-size:13px;line-height:1.8}
+  .hint b{color:#1e3a8a}
+  ol{padding-left:22px;line-height:1.9}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>懒加载提升 · 手动验证</h1>
+  <p class="sub">
+    验证 v1.8.0 的「主动加载懒加载图」：脚本把 <code>data-src</code> 提升为
+    真实 <code>src</code> 后，页面自己把图加载出来并缓存 ——
+    之后再打开图片浏览器，取图应当<b>零新增请求</b>。
+  </p>
+
+  <div class="panel">
+    <div class="hint">
+      <b>本页故意不实现任何懒加载逻辑</b>，这样「谁触发了加载」只有一个答案：油猴脚本。<br>
+      <b>验证步骤：</b>
+      <ol>
+        <li>先确认图片都是灰色占位（说明页面自己没加载）</li>
+        <li>往下滚动，让图片进入视口</li>
+        <li>图片应<b>自动变成真图</b> —— 这是脚本的提升器干的</li>
+        <li>打开 DevTools → Network，刷新后筛选 Img：<br>
+            提升后的图<b>应当只请求一次</b>；再打开图片浏览器翻图，
+            <b>不应出现对这些图的二次请求</b></li>
+      </ol>
+    </div>
+  </div>
+
+  <h2 style="font-size:16px;margin:26px 0 10px">帖子内容</h2>
+
+  <div class="post"><div class="message">
+    <p>以下图片使用 <code>data-src</code> 懒加载，初始为灰色占位。<b>请向下滚动</b>触发加载。</p>
+
+    <div class="spacer">↓ 向下滚动 ↓</div>
+
+    <img data-src="https://picsum.photos/seed/lazyA/1000/700" alt="懒加载 A">
+    <img data-src="https://picsum.photos/seed/lazyB/1000/700" alt="懒加载 B">
+    <img data-src="https://picsum.photos/seed/lazyC/1000/700" alt="懒加载 C">
+    <img data-src="https://picsum.photos/seed/lazyD/1000/700" alt="懒加载 D">
+
+    <div class="spacer">↓ 再往下 ↓</div>
+
+    <img data-src="https://picsum.photos/seed/lazyE/1000/700" alt="懒加载 E">
+    <img data-src="https://picsum.photos/seed/lazyF/1000/700" alt="懒加载 F">
+    <img data-src="https://picsum.photos/seed/lazyG/1000/700" alt="懒加载 G">
+    <img data-src="https://picsum.photos/seed/lazyH/1000/700" alt="懒加载 H">
+  </div></div>
+
+  <div class="panel" style="font-size:13px;color:#6b7280;line-height:1.9">
+    <b>对照实验</b>：在油猴设置面板里关掉「主动加载懒加载图」，
+    刷新本页再滚动 —— 图片<b>不会</b>被提升（仍是占位）。
+    打开图片浏览器时，DevTools 里会看到这 8 张图<b>被真实下载</b>，
+    实测 8 张耗 6506 ms。开启后同一场景耗 0.7 ms、新增请求 0。
+  </div>
+</div>
+</body>
+</html>

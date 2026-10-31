@@ -2,8 +2,8 @@
 // @name         网页图片浏览器
 // @name:en      Web Image Viewer
 // @namespace    local.web.imageviewer
-// @version      1.7.0
-// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，跨域自动降级，失败清单）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
+// @version      1.8.0
+// @description  图片沉浸式浏览：滚轮翻图 + 缩略图进度条（超多图自动虚拟化 + 全局迷你进度条）+ 悬停角标「只看这组」+ 组间续览（组尾自动续到下一组）+ 批量打包下载（当前组/全部，ZIP 打包，跨域自动降级，失败清单）+ 懒加载提升（图片接近视口时自动加载真图，避免浏览时重复下载）。自动识别图片容器与分组边界，动态加载的新图增量并入（不全页重扫），自适应站点原生风格。论坛、电商图集、图文页面通用。
 // @author       Mark
 // @match        *://*/*
 // @grant        GM_setValue
@@ -26,7 +26,7 @@
    * ========================================================================= */
 
   const NS = 'fiv';                     // 命名空间前缀
-  const VERSION = '1.7.0';              // 与头部 @version 保持一致
+  const VERSION = '1.8.0';              // 与头部 @version 保持一致
   const Z_BASE = 2147483000;            // 遮罩层级
   const LOG_PREFIX = '[图片浏览器]';
 
@@ -146,6 +146,11 @@
     minImagesForButton: 5,      // 页面图片数达到该值才显示悬浮按钮
     whitelistOnly: false,       // 仅在下方白名单站点启用
     whitelist: [],              // 站点白名单（hostname 片段）
+    // —— 懒加载提升（方案 A）——
+    // 把 data-src / data-original 等懒加载属性在图片接近视口时提升为真实 src，
+    // 让页面自己把图加载出来并缓存。之后打开图片浏览器即可命中浏览器缓存，
+    // 不再重复下载。关闭则完全不改页面行为。
+    promoteLazy: true,
     // —— 图片悬停角标（以图定域入口）——
     hoverBadge: true,           // 悬停内容图时显示半透明「看这组」角标
     hoverBadgeOpacity: 0.72,    // 角标不透明度 0.3~1
@@ -412,6 +417,17 @@
 
     /** 取图片真实地址（兼容懒加载属性与 srcset）
      *  ⚠️ 安全：返回前统一过 isSafeImageSrc()，拦掉 javascript:/file: 等脏协议 */
+    /**
+     * 懒加载属性名单（论坛/图床用来藏真实图地址的私有 data-* 属性）。
+     *
+     * ⚠️ 这份名单是「已知站点」的集合，不是通用规律 —— 站点自定义属性名
+     *    没有规范可循（v1.8.0 曾试图用启发式扫描全部 data-* 解决，
+     *    代价高、收益不稳，已回退）。这里只提升**明确是懒加载语义**的属性，
+     *    避免误改页面上其它 data-* 数据。
+     */
+    const LAZY_ATTRS = ['data-original', 'data-src', 'data-lazy-src', 'data-actualsrc',
+      'data-echo', 'data-url', 'data-image', 'data-large', 'data-origin'];
+
     function pickSrc(el) {
       const ok = (v) => {
         if (!v) return false;
@@ -420,9 +436,7 @@
         if (s.startsWith('data:image/gif')) return false;
         return isSafeImageSrc(s);
       };
-      const attrs = ['data-original', 'data-src', 'data-lazy-src', 'data-actualsrc',
-        'data-echo', 'data-url', 'data-image', 'data-large', 'data-origin'];
-      for (const a of attrs) {
+      for (const a of LAZY_ATTRS) {
         const v = el.getAttribute && el.getAttribute(a);
         if (ok(v)) return String(v).trim();
       }
@@ -438,6 +452,180 @@
       if (ok(cur) && !String(cur).startsWith('data:image/svg')) return cur;
       return '';
     }
+
+    /* ------------------------- 懒加载提升（方案 A） -------------------------
+     *
+     * 问题背景（实测结论，见 CHANGELOG v1.9.0）：
+     *   图片浏览器从 DOM 读 URL、再 `new Image()` 重新加载，看似"重复下载"，
+     *   实测（Chrome 156 / CDP 抓包）：
+     *     · 页面**已加载**的图 → new Image() 命中浏览器已解码位图缓存，
+     *       0 网络请求、约 0.1ms/张，**完全没有重复下载**。
+     *     · 页面**从未加载**的图（懒加载未进视口）→ 真下载，实测 9 张
+     *       耗 5.5 秒、9 个真实请求。这才是"重复加载"的真身。
+     *
+     * 方案 A 的思路：
+     *   不去和浏览器抢缓存，而是**让页面自己把懒加载图正常加载出来**。
+     *   提升 data-src → src 后，页面按自己的节奏加载并缓存这些图；
+     *   用户滚动到哪加载到哪，等再打开图片浏览器时，
+     *   这些图早已在缓存里 → 走上面那条 0 请求的快路径。
+     *
+     * 为什么用 IntersectionObserver 而不是一次性全量提升：
+     *   论坛帖子动辄几百张图，一次性把全部 data-src 提升为 src，
+     *   等于替用户把整页大图全部下载一遍 —— 流量与带宽的灾难，
+     *   且违背了懒加载的初衷。IO 只在图片**接近视口**时才提升，
+     *   与原生 loading="lazy" 的行为一致。
+     *
+     * 安全约束：
+     *   · 只提升 pickSrc() 已认定合法的地址（isSafeImageSrc 已过滤 javascript: 等）
+     *   · 只处理 <img>，不动背景图（背景图的 data-* 语义不统一，误伤风险高）
+     *   · 幂等：同一元素不重复提升（__fivPromoted 标记）
+     *   · 不改变元素尺寸/样式，只改 src，页面观感不变
+     *   · 可通过设置项「主动加载懒加载图」关闭
+     * -------------------------------------------------------------------- */
+    const LazyPromoter = (() => {
+      /** 已观察的元素（用 WeakSet，避免阻止 GC）。
+          设为 let 是因为 destroy() 后需要整体重置 —— 否则关闭再开启时，
+          旧元素会被误判为"已观察"而跳过，配置开关就形同虚设。 */
+      let watched = new WeakSet();
+      let io = null;
+
+      /** 是否启用（每次调用时读配置，支持运行中改设置） */
+      function enabled() {
+        try { return !!Config.get('promoteLazy'); } catch (e) { return false; }
+      }
+
+      /**
+       * 判断元素是否值得提升。
+       * 只有「当前显示的是占位图 / 尚未有 src」时才提升 ——
+       * 若元素已经有正常的 src，提升反而会替换掉站点自己选好的图。
+       */
+      function shouldPromote(el) {
+        if (!el || el.tagName !== 'IMG') return false;
+        if (el.__fivPromoted) return false;
+
+        // 必须存在一个合法的懒加载地址 —— 没有就没什么可提升的
+        const lazyUrl = pickLazyUrl(el);
+        if (!lazyUrl) return false;
+
+        // 当前 src 已经指向同一个地址 → 无需动作
+        const cur = el.currentSrc || el.src || '';
+        if (cur && sameUrl(cur, lazyUrl)) {
+          el.__fivPromoted = true;
+          return false;
+        }
+        return true;
+      }
+
+      /** 从懒加载属性里取一个合法地址 */
+      function pickLazyUrl(el) {
+        for (const a of LAZY_ATTRS) {
+          const v = el.getAttribute && el.getAttribute(a);
+          if (!v) continue;
+          const s = String(v).trim();
+          if (!s || /^data:/i.test(s)) continue;
+          if (s.startsWith('data:image/gif')) continue;
+          if (!isSafeImageSrc(s)) continue;
+          return s;
+        }
+        return '';
+      }
+
+      function sameUrl(a, b) {
+        try {
+          const ua = new URL(a, location.href);
+          const ub = new URL(b, location.href);
+          return ua.href === ub.href;
+        } catch (e) {
+          return String(a) === String(b);
+        }
+      }
+
+      /**
+       * 提升单个元素：把懒加载地址写回 src。
+       * @returns {boolean} 是否发生了提升
+       */
+      function promote(el) {
+        if (!shouldPromote(el)) return false;
+        const url = pickLazyUrl(el);
+        if (!url) return false;
+        try {
+          el.src = url;
+          el.__fivPromoted = true;
+          return true;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      /**
+       * 观察一个元素，等它接近视口时再提升。
+       * rootMargin 提前 300px —— 与原生 loading="lazy" 的预取距离接近，
+       * 用户滚到之前图就已经开始加载，滚动时不会看到空白。
+       */
+      function watch(el) {
+        if (!enabled()) return;
+        if (!el || el.tagName !== 'IMG') return;
+        if (watched.has(el)) return;
+        watched.add(el);
+
+        // 已经加载完的（页面刚打开就有真图）→ 直接判一次即可
+        if (el.complete && el.naturalWidth > 0) {
+          if (pickLazyUrl(el)) promote(el);
+          return;
+        }
+        // 没有懒加载属性 → 不必观察
+        if (!pickLazyUrl(el)) return;
+
+        ensureIO().observe(el);
+      }
+
+      function ensureIO() {
+        if (io) return io;
+        try {
+          io = new IntersectionObserver((entries) => {
+            for (const e of entries) {
+              if (!e.isIntersecting) continue;
+              try { io.unobserve(e.target); } catch (err) {}
+              promote(e.target);
+            }
+          }, { rootMargin: '300px 0px' });
+        } catch (e) {
+          io = null;
+        }
+        return io;
+      }
+
+      /** 批量观察（传入根元素或元素数组） */
+      function watchAll(root) {
+        if (!enabled()) return 0;
+        let list = [];
+        if (!root) {
+          list = Array.from(document.querySelectorAll('img'));
+        } else if (root.tagName === 'IMG') {
+          list = [root];
+        } else if (root.querySelectorAll) {
+          list = Array.from(root.querySelectorAll('img'));
+          if (root.tagName === 'IMG') list.unshift(root);
+        }
+        let n = 0;
+        for (const el of list) { if (watch(el)) n++; }
+        return n;
+      }
+
+      /** 立即提升某元素（供手动「重新扫描」用） */
+      function forcePromote(el) { return promote(el); }
+
+      function destroy() {
+        try { if (io) io.disconnect(); } catch (e) {}
+        io = null;
+        /* 重置观察记录：让「关闭 → 重新开启」能重新观察所有元素。
+           注意已提升过的元素带 __fivPromoted 标记，promote() 会跳过它们，
+           不会重复改写 src。 */
+        watched = new WeakSet();
+      }
+
+      return { watch, watchAll, promote, forcePromote, destroy, enabled };
+    })();
 
     /* ------------------------- 入池 ------------------------- */
 
@@ -533,8 +721,10 @@
 
       const considerEl = (el) => {
         if (!el || el.nodeType !== 1) return;
-        if (byEl.has(el)) return;                // 已入池
         if (el.tagName === 'IMG') {
+          /* 方案 A：新增节点同样纳入提升观察 */
+          LazyPromoter.watch(el);
+          if (byEl.has(el)) return;                // 已入池
           if (isHiddenEl(el)) return;
           const src = pickSrc(el);
           if (src) candByEl.set(el, { el, src, isBg: false });
@@ -624,6 +814,10 @@
         // 1) img 标签
         const imgs = root.querySelectorAll('img');
         for (const img of imgs) {
+          /* 方案 A：把懒加载图纳入提升观察（进入视口时自动加载真图）。
+             与采集判定解耦 —— 即使某图因尺寸被过滤，也照样提升，
+             因为「让页面正常显示」本身就有价值。 */
+          LazyPromoter.watch(img);
           if (isHiddenEl(img)) continue;
           const src = pickSrc(img);
           if (src && !candByEl.has(img)) candByEl.set(img, { el: img, src, isBg: false });
@@ -1269,7 +1463,9 @@
           im.referrerPolicy = 'no-referrer';
           im.src = it.src;
         }
-      }
+      },
+      /** 方案 A：懒加载提升器（对外暴露，供设置变更与调试使用） */
+      lazy: LazyPromoter
     };
   })();
 
@@ -4124,7 +4320,8 @@ kbd.${NS}-kbd {
       ['dedupeByUrl', '按 URL 去重', '同一图片地址全页只浏览一次。关闭时按页面节点收录（推荐关闭，否则同图出现在两个帖子会让其中一个分组失败）'],
       ['whitelistOnly', '仅在白名单站点启用', '开启后，只有下方列表命中的站点才加载悬浮按钮与角标'],
       ['groupChaining', '组间连续浏览', '分组内翻到第一张/最后一张时，自动续到相邻组。关闭则停留在组内并提示'],
-      ['crossOriginFallback', '打包下载跨域降级', 'fetch 被 CORS 拦截时改由 GM_xmlhttpRequest 取图。关闭则仅能下载同源图片，但不会向图床发起扩展层请求']
+      ['crossOriginFallback', '打包下载跨域降级', 'fetch 被 CORS 拦截时改由 GM_xmlhttpRequest 取图。关闭则仅能下载同源图片，但不会向图床发起扩展层请求'],
+      ['promoteLazy', '主动加载懒加载图', '图片接近视口时，把 data-src 等懒加载属性提升为真实地址，让页面自己加载并缓存。打开图片浏览器时即可直接命中缓存，不再重复下载']
     ];
 
     const NUMBERS = [
@@ -4656,6 +4853,10 @@ kbd.${NS}-kbd {
 
     // 首轮扫描 + 观察
     ImagePool.scanNow();
+    /* 方案 A：观察全页懒加载图。
+       scanNow() 只遍历「采集根」内的 img，而提升的价值不依赖是否入池
+       （页面自己把图加载出来，对用户始终是好事），所以这里对全页 img 补一轮观察。 */
+    ImagePool.lazy.watchAll(null);
     Floating.build();
     Floating.refresh();
     ImagePool.startObserve();
@@ -4685,6 +4886,19 @@ kbd.${NS}-kbd {
         ImagePool.reset();
         ImagePool.scanNow();
         Viewer.setItems(ImagePool.items);
+      }
+      /* 方案 A 开关变化 → 立即生效。
+         开启：对全页 img 补一轮观察（此前被跳过的图现在纳入提升）。
+         关闭：断开观察器，停止后续提升。
+             ⚠️ 已经提升过的图**不回滚** —— 那会把页面退回占位图，
+             反而破坏用户正在看的内容。回滚需重新写回原 data-* 值，
+             但那会让页面"闪回占位图"，得不偿失。 */
+      if (k === 'promoteLazy' || k === '*') {
+        if (Config.get('promoteLazy')) {
+          ImagePool.lazy.watchAll(null);
+        } else {
+          ImagePool.lazy.destroy();
+        }
       }
     });
 

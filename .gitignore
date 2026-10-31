@@ -11,6 +11,14 @@
 # 开发期的临时验证脚本（如 tmp-*.js），确认无价值后应清理
 tmp-*.js
 *.tmp
+# 临时工作目录（CDP 实验脚本等，一次性产物）
+.workbuddy/tmp/
+
+# —— 实验产物（一次性数据，不入库）——
+*-result.json
+lazy-ab-result.json
+lazy-verify-result.json
+reuse-experiment*.json
 
 # —— 本地环境 ——
 .DS_Store
